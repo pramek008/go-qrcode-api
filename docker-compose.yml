@@ -1,0 +1,49 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: qrservice-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-qruser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qrpass}
+      POSTGRES_DB: ${POSTGRES_DB:-qrservice}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - qrnet
+
+  qrservice:
+    build: .
+    container_name: qrservice
+    restart: unless-stopped
+    ports:
+      - "${PORT_EXTERNAL:-9080}:8080"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-qruser}:${POSTGRES_PASSWORD:-qrpass}@db:5432/${POSTGRES_DB:-qrservice}?sslmode=disable
+    volumes:
+      - qr_storage:/app/storage/qrcodes
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - qrnet
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:8080/health" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  pgdata:
+  qr_storage:
+
+networks:
+  qrnet:
+    driver: bridge
