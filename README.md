@@ -19,7 +19,8 @@ A self-hosted, batteries-included QR code generation API — compatible with the
 - **Error correction** — L / M / Q / H levels for print durability or logo tolerance
 - **Persistent history** — Save generated QRs to PostgreSQL, list, search, filter, and download
 - **Stateless mode** — Generate on-the-fly without storing anything
-- **Security built in** — Rate limiting, CORS, optional API key auth, graceful shutdown
+- **Multi-key management** — Issue per-client API keys with individual rate limits and usage quotas
+- **Security built in** — Rate limiting, CORS, API key auth, graceful shutdown
 - **Zero-dependency DB** — Bundled PostgreSQL in docker-compose, auto-migration on startup
 
 ## 🚀 Quick Start
@@ -58,6 +59,9 @@ curl 'http://localhost:9080/health'
   - [Generate QR (stateless)](#generate-qr-stateless)
   - [Management Endpoints](#management-endpoints)
   - [Health & Metrics](#health--metrics)
+- [API Key Management](#-api-key-management)
+  - [Admin Endpoints](#admin-endpoints)
+  - [Client Usage](#client-usage)
 - [Environment Variables](#-environment-variables)
 - [QR Features](#-qr-features)
   - [Padding & Margins](#padding--margins)
@@ -171,7 +175,7 @@ GET /v1/create-qr-code?data=branded&format=png&logo=iVBORw0KGgo...&save
 
 ### Management Endpoints
 
-When `API_KEY` is set, these endpoints require `X-API-Key: <key>` header or `?api_key=<key>` query param.
+These endpoints require an API key — see [API Key Management](#-api-key-management). Authenticate via `X-API-Key: <key>` header or `?api_key=<key>` query param.
 
 | Method | Path | Description |
 |---|---|---|
@@ -258,6 +262,68 @@ GET /metrics
 
 ---
 
+## 🔑 API Key Management
+
+The management endpoints (`/v1/qr/*`) require an API key. Instead of a single static key, you create **per-client keys** via admin endpoints — each with its own rate limit and monthly quota.
+
+### Admin Endpoints
+
+Protected by `ADMIN_KEY` env var (passed via `X-Admin-Key` header or `?admin_key` query param).
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/admin/keys` | Create a new API key for a client |
+| `GET` | `/v1/admin/keys` | List all API keys |
+| `GET` | `/v1/admin/keys/:id` | Get single key details |
+| `DELETE` | `/v1/admin/keys/:id` | Revoke (deactivate) a key |
+| `POST` | `/v1/admin/keys/:id/rotate` | Generate a new key string |
+
+**Create a key:**
+
+```bash
+curl -X POST http://localhost:9080/v1/admin/keys \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Client A", "rate_limit": 100, "rate_limit_window": 60, "quota": 5000}'
+```
+
+**Response:**
+
+```json
+{
+  "key": {
+    "id": "uuid",
+    "name": "Client A",
+    "key": "abc123...",
+    "rate_limit": 100,
+    "rate_limit_window": 60,
+    "quota": 5000,
+    "quota_used": 0,
+    "is_active": true
+  }
+}
+```
+
+| Body field | Default | Description |
+|---|---|---|
+| `name` | *required* | Human-readable label for the client |
+| `rate_limit` | `30` | Max requests per window |
+| `rate_limit_window` | `60` | Window duration in seconds |
+| `quota` | `0` | Total request quota (`0` = unlimited) |
+
+### Client Usage
+
+Clients use their key via `X-API-Key` header or `?api_key` query param:
+
+```bash
+curl -H "X-API-Key: abc123..." \
+  http://localhost:9080/v1/qr?limit=10
+```
+
+Each key's rate limit and quota are enforced per-request. Keys can be revoked without restarting the service.
+
+---
+
 ## 🔧 Environment Variables
 
 | Variable | Default | Required | Description |
@@ -266,7 +332,7 @@ GET /metrics
 | `PORT` | `8080` | No | Server listen port |
 | `STORAGE_DIR` | `/app/storage/qrcodes` | No | QR file storage directory |
 | `MIGRATIONS_DIR` | `./migrations` | No | Path to SQL migration files |
-| `API_KEY` | *(empty)* | No | Protects `/v1/qr/*` endpoints when set |
+| `ADMIN_KEY` | *(empty)* | No | Master key for `/v1/admin/*` key management endpoints |
 | `CORS_ORIGINS` | `*` | No | Comma-separated allowed origins |
 | `RATE_LIMIT_MAX` | `30` | No | Max requests per IP per window |
 | `RATE_LIMIT_EXPIRATION` | `60s` | No | Rate limit window duration |

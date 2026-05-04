@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,7 +31,7 @@ type Config struct {
 	DatabaseURL   string
 	StorageDir    string
 	MigrationsDir string
-	APIKey        string
+	AdminKey      string
 	CORSOrigins   string
 	RateLimit     struct {
 		Max        int
@@ -45,7 +46,7 @@ func loadConfig() Config {
 		DatabaseURL:   mustEnv("DATABASE_URL"),
 		StorageDir:    getEnv("STORAGE_DIR", "./storage/qrcodes"),
 		MigrationsDir: getEnv("MIGRATIONS_DIR", "./migrations"),
-		APIKey:        os.Getenv("API_KEY"),
+		AdminKey:      os.Getenv("ADMIN_KEY"),
 		CORSOrigins:   getEnv("CORS_ORIGINS", "*"),
 		DBMaxConns:    getEnvInt("DB_MAX_CONNS", 20),
 	}
@@ -104,9 +105,14 @@ func main() {
 	}
 
 	// Layers
-	repo := repository.New(db)
-	svc := service.New(repo, cfg.StorageDir)
-	h := handler.New(svc)
+	qrRepo := repository.New(db)
+	qrSvc := service.New(qrRepo, cfg.StorageDir)
+	qrHandler := handler.New(qrSvc)
+
+	// API key management layer
+	apiKeyRepo := repository.NewApiKeyRepo(db)
+	apiKeySvc := service.NewApiKeyService(apiKeyRepo)
+	apiKeyHandler := handler.NewApiKeyHandler(apiKeySvc)
 
 	// Fiber
 	app := fiber.New(fiber.Config{
@@ -123,7 +129,7 @@ func main() {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: cfg.CORSOrigins,
 		AllowMethods: "GET,POST,DELETE",
-		AllowHeaders: "Origin,Content-Type,Accept,X-API-Key",
+		AllowHeaders: "Origin,Content-Type,Accept,X-API-Key,X-Admin-Key",
 	}))
 	app.Use(limiter.New(limiter.Config{
 		Max:        cfg.RateLimit.Max,
@@ -140,18 +146,29 @@ func main() {
 	v1 := app.Group("/v1")
 
 	// goqr.me-compatible endpoint (public)
-	v1.Get("/create-qr-code", h.CreateQR)
+	v1.Get("/create-qr-code", qrHandler.CreateQR)
 
-	// Management endpoints (API key protected)
+	// Management endpoints — authenticated via API key from DB
 	mgmt := app.Group("/v1/qr")
-	if cfg.APIKey != "" {
-		mgmt.Use(apiKeyAuth(cfg.APIKey))
+	mgmt.Use(apiKeyAuth(apiKeySvc))
+	mgmt.Use(perKeyRateLimiter())
+	mgmt.Use(quotaEnforcer(apiKeySvc))
+	mgmt.Post("/", qrHandler.CreateAndSaveQR)
+	mgmt.Get("/", qrHandler.ListQR)
+	mgmt.Get("/:id", qrHandler.GetQR)
+	mgmt.Get("/:id/download", qrHandler.DownloadQR)
+	mgmt.Delete("/:id", qrHandler.DeleteQR)
+
+	// Admin endpoints — API key CRUD (protected by ADMIN_KEY)
+	admin := app.Group("/v1/admin")
+	if cfg.AdminKey != "" {
+		admin.Use(adminAuth(cfg.AdminKey))
 	}
-	mgmt.Post("/", h.CreateAndSaveQR)
-	mgmt.Get("/", h.ListQR)
-	mgmt.Get("/:id", h.GetQR)
-	mgmt.Get("/:id/download", h.DownloadQR)
-	mgmt.Delete("/:id", h.DeleteQR)
+	admin.Post("/keys", apiKeyHandler.CreateKey)
+	admin.Get("/keys", apiKeyHandler.ListKeys)
+	admin.Get("/keys/:id", apiKeyHandler.GetKey)
+	admin.Delete("/keys/:id", apiKeyHandler.RevokeKey)
+	admin.Post("/keys/:id/rotate", apiKeyHandler.RotateKey)
 
 	// Health with DB verification
 	app.Get("/health", func(c *fiber.Ctx) error {
@@ -204,15 +221,103 @@ func main() {
 
 // --- Middleware ---
 
-// apiKeyAuth returns middleware that requires a valid API key via X-API-Key header
-// or ?api_key query parameter. If apiKey is empty, auth is skipped.
-func apiKeyAuth(apiKey string) fiber.Handler {
+// apiKeyAuth returns middleware that validates API keys against the database.
+// Valid keys are stored in c.Locals("apiKey") for downstream middleware.
+func apiKeyAuth(svc *service.ApiKeyService) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		key := c.Get("X-API-Key")
 		if key == "" {
 			key = c.Query("api_key")
 		}
-		if key != apiKey {
+		if key == "" {
+			return c.Status(401).JSON(fiber.Map{"error": "missing api key"})
+		}
+
+		ak, err := svc.ValidateKey(c.Context(), key)
+		if err != nil {
+			return c.Status(401).JSON(fiber.Map{"error": "unauthorized"})
+		}
+
+		// Store validated key in context for downstream use
+		c.Locals("apiKey", ak)
+		return c.Next()
+	}
+}
+
+// perKeyRateLimiter enforces the per-key rate limit defined on the ApiKey record.
+func perKeyRateLimiter() fiber.Handler {
+	type window struct {
+		count   int
+		resetAt time.Time
+	}
+	var (
+		mu      sync.Mutex
+		windows = map[string]*window{}
+	)
+
+	return func(c *fiber.Ctx) error {
+		ak, ok := c.Locals("apiKey").(*repository.ApiKey)
+		if !ok || ak.RateLimit <= 0 {
+			return c.Next()
+		}
+
+		mu.Lock()
+		w, exists := windows[ak.Key]
+		now := time.Now()
+		if !exists || now.After(w.resetAt) {
+			w = &window{count: 1, resetAt: now.Add(time.Duration(ak.RateLimitWindow) * time.Second)}
+			windows[ak.Key] = w
+		} else {
+			w.count++
+		}
+		count := w.count
+		resetAt := w.resetAt
+		mu.Unlock()
+
+		// Evict old entries periodically
+		if !exists {
+			go func() {
+				time.Sleep(time.Duration(ak.RateLimitWindow) * time.Second)
+				mu.Lock()
+				delete(windows, ak.Key)
+				mu.Unlock()
+			}()
+		}
+
+		if count > ak.RateLimit {
+			return c.Status(429).JSON(fiber.Map{
+				"error":    "rate limit exceeded",
+				"retry_at": resetAt.Format(time.RFC3339),
+			})
+		}
+		return c.Next()
+	}
+}
+
+// quotaEnforcer checks and increments the usage quota for the key.
+func quotaEnforcer(svc *service.ApiKeyService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		ak, ok := c.Locals("apiKey").(*repository.ApiKey)
+		if !ok {
+			return c.Next()
+		}
+		if err := svc.CheckQuota(c.Context(), ak); err != nil {
+			return c.Status(429).JSON(fiber.Map{"error": "quota exceeded"})
+		}
+		// Fire-and-forget last-used update
+		go svc.TouchLastUsed(context.Background(), ak)
+		return c.Next()
+	}
+}
+
+// adminAuth returns middleware that requires the ADMIN_KEY via X-Admin-Key header.
+func adminAuth(adminKey string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		key := c.Get("X-Admin-Key")
+		if key == "" {
+			key = c.Query("admin_key")
+		}
+		if key != adminKey {
 			return c.Status(401).JSON(fiber.Map{"error": "unauthorized"})
 		}
 		return c.Next()
