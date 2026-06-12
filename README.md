@@ -27,8 +27,8 @@ A self-hosted, batteries-included QR code generation API — compatible with the
 
 ```bash
 # 1. Clone
-git clone https://github.com/ekanovation/qrservice.git
-cd qrservice
+git clone https://github.com/pramek008/go-qrcode-api.git
+cd go-qrcode-api
 
 # 2. Configure (optional — defaults work out of the box)
 cp .env.example .env
