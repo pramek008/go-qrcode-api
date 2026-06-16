@@ -129,6 +129,11 @@ Or run without Docker at all (see [Local Development](#-local-development)).
 
 ## 📡 API Reference
 
+### You can try with this base url
+```
+https://qrcode.ekanovation.my.id
+```
+
 ### Generate QR (stateless)
 
 ```
