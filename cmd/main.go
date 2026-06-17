@@ -28,7 +28,7 @@ import (
 // Config holds all application configuration, loaded from environment variables.
 type Config struct {
 	Port          string
-	DatabaseURL   string
+	DatabaseURL   string // empty → stateless-only mode, no persistence
 	StorageDir    string
 	MigrationsDir string
 	AdminKey      string
@@ -43,7 +43,7 @@ type Config struct {
 func loadConfig() Config {
 	cfg := Config{
 		Port:          getEnv("PORT", "8080"),
-		DatabaseURL:   mustEnv("DATABASE_URL"),
+		DatabaseURL:   os.Getenv("DATABASE_URL"), // optional
 		StorageDir:    getEnv("STORAGE_DIR", "./storage/qrcodes"),
 		MigrationsDir: getEnv("MIGRATIONS_DIR", "./migrations"),
 		AdminKey:      os.Getenv("ADMIN_KEY"),
@@ -58,69 +58,27 @@ func loadConfig() Config {
 func main() {
 	_ = godotenv.Load()
 
-	// Structured JSON logger
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	cfg := loadConfig()
-	slog.Info("starting qrservice", "port", cfg.Port)
 
-	// Ensure storage dir exists
+	// Determine run mode from whether DATABASE_URL is set.
+	mode := "full"
+	if cfg.DatabaseURL == "" {
+		mode = "stateless"
+	}
+	slog.Info("starting qrservice", "port", cfg.Port, "mode", mode)
+
 	if err := os.MkdirAll(cfg.StorageDir, 0755); err != nil {
 		slog.Error("failed to create storage dir", "error", err)
 		os.Exit(1)
 	}
 
-	// DB pool with config
-	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
-	if err != nil {
-		slog.Error("invalid database URL", "error", err)
-		os.Exit(1)
-	}
-	poolCfg.MaxConns = int32(cfg.DBMaxConns)
-
-	db, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
-	if err != nil {
-		slog.Error("failed to connect to db", "error", err)
-		os.Exit(1)
-	}
-	defer db.Close()
-
-	if err := db.Ping(context.Background()); err != nil {
-		slog.Error("db ping failed", "error", err)
-		os.Exit(1)
-	}
-	slog.Info("connected to PostgreSQL")
-
-	// Auto-migration
-	if err := migration.Run(context.Background(), db, cfg.MigrationsDir); err != nil {
-		// Directory missing is recoverable (dev convenience); SQL errors are fatal.
-		if errors.Is(err, os.ErrNotExist) {
-			slog.Warn("migrations directory not found — continuing without migrations", "dir", cfg.MigrationsDir)
-		} else {
-			slog.Error("auto-migration failed", "error", err)
-			os.Exit(1)
-		}
-	} else {
-		slog.Info("migrations applied")
-	}
-
-	// Layers
-	qrRepo := repository.New(db)
-	qrSvc := service.New(qrRepo, cfg.StorageDir)
-	qrHandler := handler.New(qrSvc)
-
-	// API key management layer
-	apiKeyRepo := repository.NewApiKeyRepo(db)
-	apiKeySvc := service.NewApiKeyService(apiKeyRepo)
-	apiKeyHandler := handler.NewApiKeyHandler(apiKeySvc)
-
-	// Fiber
 	app := fiber.New(fiber.Config{
 		AppName:      "QR Service",
 		ErrorHandler: customErrorHandler,
 	})
 
-	// Middleware stack
 	app.Use(recover.New())
 	app.Use(logger.New(logger.Config{
 		Format:     "${time} | ${status} | ${latency} | ${ip} | ${method} ${path}\n",
@@ -142,63 +100,17 @@ func main() {
 		},
 	}))
 
-	// Routes
-	v1 := app.Group("/v1")
-
-	// goqr.me-compatible endpoint (public)
-	v1.Get("/create-qr-code", qrHandler.CreateQR)
-
-	// Management endpoints — authenticated via API key from DB
-	mgmt := app.Group("/v1/qr")
-	mgmt.Use(apiKeyAuth(apiKeySvc))
-	mgmt.Use(perKeyRateLimiter())
-	mgmt.Use(quotaEnforcer(apiKeySvc))
-	mgmt.Post("/", qrHandler.CreateAndSaveQR)
-	mgmt.Get("/", qrHandler.ListQR)
-	mgmt.Get("/:id", qrHandler.GetQR)
-	mgmt.Get("/:id/download", qrHandler.DownloadQR)
-	mgmt.Delete("/:id", qrHandler.DeleteQR)
-
-	// Admin endpoints — API key CRUD (protected by ADMIN_KEY)
-	admin := app.Group("/v1/admin")
-	if cfg.AdminKey != "" {
-		admin.Use(adminAuth(cfg.AdminKey))
+	if cfg.DatabaseURL != "" {
+		// ── Full mode: DB available ──────────────────────────────────────────
+		registerFullMode(app, cfg)
+	} else {
+		// ── Stateless-only mode: no DB ───────────────────────────────────────
+		registerStatelessMode(app, cfg)
 	}
-	admin.Post("/keys", apiKeyHandler.CreateKey)
-	admin.Get("/keys", apiKeyHandler.ListKeys)
-	admin.Get("/keys/:id", apiKeyHandler.GetKey)
-	admin.Delete("/keys/:id", apiKeyHandler.RevokeKey)
-	admin.Post("/keys/:id/rotate", apiKeyHandler.RotateKey)
 
-	// Health with DB verification
-	app.Get("/health", func(c *fiber.Ctx) error {
-		ctx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
-		defer cancel()
-		if err := db.Ping(ctx); err != nil {
-			return c.Status(503).JSON(fiber.Map{
-				"status": "unhealthy",
-				"error":  "database unreachable",
-			})
-		}
-		return c.JSON(fiber.Map{"status": "ok"})
-	})
-
-	// Metrics
-	app.Get("/metrics", func(c *fiber.Ctx) error {
-		stats := db.Stat()
-		return c.JSON(fiber.Map{
-			"db": fiber.Map{
-				"total_conns":    stats.TotalConns(),
-				"idle_conns":     stats.IdleConns(),
-				"acquired_conns": stats.AcquiredConns(),
-			},
-		})
-	})
-
-	// Graceful shutdown
 	go func() {
 		addr := fmt.Sprintf(":%s", cfg.Port)
-		slog.Info("server listening", "addr", addr)
+		slog.Info("server listening", "addr", addr, "mode", mode)
 		if err := app.Listen(addr); err != nil {
 			slog.Error("server error", "error", err)
 		}
@@ -211,18 +123,137 @@ func main() {
 	slog.Info("shutting down server...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
 		slog.Error("forced shutdown", "error", err)
 	}
-	db.Close()
 	slog.Info("server stopped")
+}
+
+// registerFullMode connects to PostgreSQL, runs migrations, and registers all
+// routes including persistence, management, and admin endpoints.
+func registerFullMode(app *fiber.App, cfg Config) {
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		slog.Error("invalid DATABASE_URL", "error", err)
+		os.Exit(1)
+	}
+	poolCfg.MaxConns = int32(cfg.DBMaxConns)
+
+	db, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	if err != nil {
+		slog.Error("failed to connect to db", "error", err)
+		os.Exit(1)
+	}
+	if err := db.Ping(context.Background()); err != nil {
+		slog.Error("db ping failed", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("connected to PostgreSQL")
+
+	if err := migration.Run(context.Background(), db, cfg.MigrationsDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			slog.Warn("migrations directory not found — continuing without migrations", "dir", cfg.MigrationsDir)
+		} else {
+			slog.Error("auto-migration failed", "error", err)
+			os.Exit(1)
+		}
+	} else {
+		slog.Info("migrations applied")
+	}
+
+	qrRepo := repository.New(db)
+	qrSvc := service.New(qrRepo, cfg.StorageDir)
+	qrHandler := handler.New(qrSvc)
+
+	apiKeyRepo := repository.NewApiKeyRepo(db)
+	apiKeySvc := service.NewApiKeyService(apiKeyRepo)
+	apiKeyHandler := handler.NewApiKeyHandler(apiKeySvc)
+
+	v1 := app.Group("/v1")
+	v1.Get("/create-qr-code", qrHandler.CreateQR)
+
+	mgmt := app.Group("/v1/qr")
+	mgmt.Use(apiKeyAuth(apiKeySvc))
+	mgmt.Use(perKeyRateLimiter())
+	mgmt.Use(quotaEnforcer(apiKeySvc))
+	mgmt.Post("/", qrHandler.CreateAndSaveQR)
+	mgmt.Get("/", qrHandler.ListQR)
+	mgmt.Get("/:id", qrHandler.GetQR)
+	mgmt.Get("/:id/download", qrHandler.DownloadQR)
+	mgmt.Delete("/:id", qrHandler.DeleteQR)
+
+	admin := app.Group("/v1/admin")
+	if cfg.AdminKey != "" {
+		admin.Use(adminAuth(cfg.AdminKey))
+	}
+	admin.Post("/keys", apiKeyHandler.CreateKey)
+	admin.Get("/keys", apiKeyHandler.ListKeys)
+	admin.Get("/keys/:id", apiKeyHandler.GetKey)
+	admin.Delete("/keys/:id", apiKeyHandler.RevokeKey)
+	admin.Post("/keys/:id/rotate", apiKeyHandler.RotateKey)
+
+	app.Get("/health", func(c *fiber.Ctx) error {
+		ctx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
+		defer cancel()
+		if err := db.Ping(ctx); err != nil {
+			return c.Status(503).JSON(fiber.Map{"status": "unhealthy", "error": "database unreachable"})
+		}
+		return c.JSON(fiber.Map{"status": "ok", "mode": "full"})
+	})
+
+	app.Get("/metrics", func(c *fiber.Ctx) error {
+		stats := db.Stat()
+		return c.JSON(fiber.Map{
+			"db": fiber.Map{
+				"total_conns":    stats.TotalConns(),
+				"idle_conns":     stats.IdleConns(),
+				"acquired_conns": stats.AcquiredConns(),
+			},
+		})
+	})
+
+	// Close pool on process exit (best-effort; main goroutine handles signal).
+	go func() {
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+		<-quit
+		db.Close()
+	}()
+}
+
+// registerStatelessMode wires the QR service with a no-op repository (no DB
+// writes) and only exposes the stateless generation endpoint. Management and
+// admin routes are not registered. Attempting ?save returns 503.
+func registerStatelessMode(app *fiber.App, cfg Config) {
+	slog.Warn("DATABASE_URL not set — running in stateless-only mode. Persistence endpoints are disabled.")
+
+	qrSvc := service.New(service.NoopRepo(), cfg.StorageDir)
+	qrHandler := handler.New(qrSvc)
+
+	v1 := app.Group("/v1")
+	v1.Get("/create-qr-code", qrHandler.CreateQR)
+
+	// Management + admin routes return 503 with a clear message.
+	unavailable := func(c *fiber.Ctx) error {
+		return c.Status(503).JSON(fiber.Map{
+			"error": "this endpoint requires a database — set DATABASE_URL to enable full mode",
+			"mode":  "stateless",
+		})
+	}
+	app.All("/v1/qr*", unavailable)
+	app.All("/v1/admin*", unavailable)
+
+	app.Get("/health", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{"status": "ok", "mode": "stateless"})
+	})
+
+	app.Get("/metrics", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{"mode": "stateless", "db": nil})
+	})
 }
 
 // --- Middleware ---
 
-// apiKeyAuth returns middleware that validates API keys against the database.
-// Valid keys are stored in c.Locals("apiKey") for downstream middleware.
 func apiKeyAuth(svc *service.ApiKeyService) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		key := c.Get("X-API-Key")
@@ -232,19 +263,15 @@ func apiKeyAuth(svc *service.ApiKeyService) fiber.Handler {
 		if key == "" {
 			return c.Status(401).JSON(fiber.Map{"error": "missing api key"})
 		}
-
 		ak, err := svc.ValidateKey(c.Context(), key)
 		if err != nil {
 			return c.Status(401).JSON(fiber.Map{"error": "unauthorized"})
 		}
-
-		// Store validated key in context for downstream use
 		c.Locals("apiKey", ak)
 		return c.Next()
 	}
 }
 
-// perKeyRateLimiter enforces the per-key rate limit defined on the ApiKey record.
 func perKeyRateLimiter() fiber.Handler {
 	type window struct {
 		count   int
@@ -254,13 +281,11 @@ func perKeyRateLimiter() fiber.Handler {
 		mu      sync.Mutex
 		windows = map[string]*window{}
 	)
-
 	return func(c *fiber.Ctx) error {
 		ak, ok := c.Locals("apiKey").(*repository.ApiKey)
 		if !ok || ak.RateLimit <= 0 {
 			return c.Next()
 		}
-
 		mu.Lock()
 		w, exists := windows[ak.Key]
 		now := time.Now()
@@ -273,8 +298,6 @@ func perKeyRateLimiter() fiber.Handler {
 		count := w.count
 		resetAt := w.resetAt
 		mu.Unlock()
-
-		// Evict old entries periodically
 		if !exists {
 			go func() {
 				time.Sleep(time.Duration(ak.RateLimitWindow) * time.Second)
@@ -283,7 +306,6 @@ func perKeyRateLimiter() fiber.Handler {
 				mu.Unlock()
 			}()
 		}
-
 		if count > ak.RateLimit {
 			return c.Status(429).JSON(fiber.Map{
 				"error":    "rate limit exceeded",
@@ -294,7 +316,6 @@ func perKeyRateLimiter() fiber.Handler {
 	}
 }
 
-// quotaEnforcer checks and increments the usage quota for the key.
 func quotaEnforcer(svc *service.ApiKeyService) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		ak, ok := c.Locals("apiKey").(*repository.ApiKey)
@@ -304,13 +325,11 @@ func quotaEnforcer(svc *service.ApiKeyService) fiber.Handler {
 		if err := svc.CheckQuota(c.Context(), ak); err != nil {
 			return c.Status(429).JSON(fiber.Map{"error": "quota exceeded"})
 		}
-		// Fire-and-forget last-used update
 		go svc.TouchLastUsed(context.Background(), ak)
 		return c.Next()
 	}
 }
 
-// adminAuth returns middleware that requires the ADMIN_KEY via X-Admin-Key header.
 func adminAuth(adminKey string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		key := c.Get("X-Admin-Key")
@@ -324,7 +343,6 @@ func adminAuth(adminKey string) fiber.Handler {
 	}
 }
 
-// customErrorHandler provides consistent JSON error responses.
 func customErrorHandler(c *fiber.Ctx, err error) error {
 	code := fiber.StatusInternalServerError
 	if e, ok := err.(*fiber.Error); ok {
@@ -335,15 +353,6 @@ func customErrorHandler(c *fiber.Ctx, err error) error {
 }
 
 // --- Config helpers ---
-
-func mustEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		slog.Error("missing required env", "key", key)
-		os.Exit(1)
-	}
-	return v
-}
 
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {

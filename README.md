@@ -6,16 +6,22 @@
 
 # QR Service
 
-A self-hosted, batteries-included QR code generation API — compatible with the **goqr.me** API format. Generate QR codes as PNG, SVG, JPEG, or WebP, with logo overlays, custom colors, error correction tuning, and persistent history.
+A self-hosted, batteries-included QR code generation API — compatible with the **goqr.me** API format. Generate QR codes as PNG, SVG, JPEG, or WebP, with logo overlays, custom colors, gradient fills, custom module shapes, content-type helpers (WiFi, vCard, …), and optional persistent history.
+
+> **Two modes:** run with just `go run` for instant stateless generation, or add a PostgreSQL database to unlock persistent history and API key management.
 
 > Spins up in seconds with `docker compose up`. No external database required.
 
 ## Features
 
 - **Multiple formats** — PNG, SVG, JPEG, and **native WebP** (real encoding, not fake)
-- **Logo overlay** — Embed a brand logo centered on the QR with automatic high error correction
-- **Custom colors** — Pick any foreground and background hex color
-- **Controllable margins** — Fine-grained `padding` parameter (0 = edge-to-edge)
+- **Content-type helpers** — Encode WiFi, vCard, MeCard, email, tel, SMS, geo, event, WhatsApp — no manual payload formatting
+- **Styling engine** — Custom module shapes (`square`, `rounded`, `dot`, `circle`), eye styles, separate eye color, linear/radial gradients
+- **Logo overlay** — Embed a brand logo centered on the QR; configurable size, shape (`square`/`circle`), and safety-zone margin
+- **Custom colors** — Hex (`#rrggbb`, `#rgb`), decimal (`r-g-b`), or `transparent` background
+- **Controllable margins** — `padding` (px) and `qzone` (quiet-zone modules) for exact whitespace control
+- **ETag / 304 caching** — Output is deterministic, so identical requests get a `304 Not Modified` for free
+- **Output modes** — Return raw image bytes (`image`), `base64` string, or full `json` with dataUri
 - **Error correction** — L / M / Q / H levels for print durability or logo tolerance
 - **Persistent history** — Save generated QRs to PostgreSQL, list, search, filter, and download
 - **Stateless mode** — Generate on-the-fly without storing anything
@@ -24,6 +30,22 @@ A self-hosted, batteries-included QR code generation API — compatible with the
 - **Zero-dependency DB** — Bundled PostgreSQL in docker-compose, auto-migration on startup
 
 ## 🚀 Quick Start
+
+### Stateless — no setup required
+
+```bash
+git clone https://github.com/pramek008/go-qrcode-api.git
+cd go-qrcode-api
+go run ./cmd/main.go
+```
+
+```bash
+curl 'http://localhost:8080/v1/create-qr-code?data=Hello%20World' --output qr.png
+curl 'http://localhost:8080/health'
+# → {"status":"ok","mode":"stateless"}
+```
+
+### Full — with PostgreSQL (Docker Compose)
 
 ```bash
 # 1. Clone
@@ -37,13 +59,12 @@ cp .env.example .env
 docker compose up -d
 ```
 
-That's it. The API is ready at `http://localhost:9080`.
-
-Try it:
+The API is ready at `http://localhost:9080`.
 
 ```bash
-curl 'http://localhost:9080/v1/create-qr-code?data=Hello%20World&format=png'
+curl 'http://localhost:9080/v1/create-qr-code?data=Hello%20World&format=png' --output qr.png
 curl 'http://localhost:9080/health'
+# → {"status":"ok","mode":"full"}
 ```
 
 ---
@@ -51,6 +72,7 @@ curl 'http://localhost:9080/health'
 ## 📖 Table of Contents
 
 - [Quick Start](#-quick-start)
+- [Modes](#-modes)
 - [Getting Started](#-getting-started)
   - [Prerequisites](#prerequisites)
   - [Option A: Docker Compose (recommended)](#option-a-docker-compose-recommended)
@@ -73,6 +95,53 @@ curl 'http://localhost:9080/health'
 - [Local Development](#-local-development)
 - [Contributing](#-contributing)
 - [License](#-license)
+
+---
+
+---
+
+## ⚙️ Modes
+
+The service detects its run mode automatically from the presence of `DATABASE_URL`.
+
+| | Stateless mode | Full mode |
+|---|---|---|
+| **How to start** | No env vars needed | Set `DATABASE_URL` |
+| **`GET /v1/create-qr-code`** | ✅ | ✅ |
+| **`?save` flag** | ❌ 503 (no DB) | ✅ |
+| **`/v1/qr/*` management** | ❌ 503 | ✅ |
+| **`/v1/admin/*` API keys** | ❌ 503 | ✅ |
+| **`/health`** | ✅ `{"status":"ok","mode":"stateless"}` | ✅ with DB ping |
+| **`/metrics`** | ✅ `{"mode":"stateless","db":null}` | ✅ with pool stats |
+
+### Stateless mode — zero dependencies
+
+No Docker, no database, no env file:
+
+```bash
+go run ./cmd/main.go
+# → {"mode":"stateless"} on startup
+# → GET /v1/create-qr-code works immediately
+```
+
+Or with Docker:
+
+```bash
+docker run -p 8080:8080 ghcr.io/pramek008/go-qrcode-api
+```
+
+### Full mode — with persistence
+
+```bash
+DATABASE_URL=postgres://user:pass@localhost:5432/qrservice go run ./cmd/main.go
+# → connects to DB, runs migrations, enables all endpoints
+```
+
+Or with Docker Compose (recommended for production):
+
+```bash
+docker compose up -d
+```
 
 ---
 
@@ -142,41 +211,109 @@ GET /v1/create-qr-code
 
 Generate a QR code on the fly. Nothing is stored unless `?save` is added.
 
+#### Basic / Data params
+
 | Query | Default | Description |
 |---|---|---|
-| `data` | *required* | Text or URL to encode |
-| `size` | `150x150` | Output dimensions — `WxH` (e.g. `400x200`) or single value `300` → `300x300` |
+| `data` | *required* | Text or URL to encode (use `type` instead for structured content) |
+| `type` | `text` | Content type — see [Content Types](#content-types) below |
+| `size` | `150x150` | Output dimensions — `WxH` (e.g. `400x200`) or `300` → `300x300` |
+| `width` / `height` | — | Alternative to `size`; override individual dimension |
 | `format` | `png` | `png`, `svg`, `jpeg`, `webp` |
-| `color` | `000000` | Foreground hex (without `#`) |
-| `bgcolor` | `ffffff` | Background hex (without `#`) |
-| `recovery` | `M` | Error correction: `L`, `M`, `Q`, `H` |
-| `logo` | *(none)* | Base64-encoded image (raw base64 or `data:image/png;base64,...` URI) |
-| `padding` | `4` | Inner margin (px) around QR within the canvas. `0` = edge-to-edge |
-| `save` | *(flag)* | Add `?save` to persist the QR to history |
+| `output` | `image` | Response mode: `image` (bytes), `base64`, or `json` (with dataUri) |
+| `download` | *(none)* | Set `Content-Disposition` filename, e.g. `download=qr.png` |
+| `save` | *(flag)* | Persist to history (no value needed) |
+
+#### Color params
+
+| Query | Default | Description |
+|---|---|---|
+| `color` | `000000` | Foreground — hex (`rrggbb` or `rgb`), or decimal `r-g-b` |
+| `bgcolor` | `ffffff` | Background — same formats, or `transparent` for alpha PNG/SVG/WebP |
+| `eye_color` | *(= color)* | Finder-pattern color — lets eyes stand out from body modules |
+
+#### Margin / quiet-zone params
+
+| Query | Default | Description |
+|---|---|---|
+| `padding` / `margin` | `4` | Outer whitespace in **px** inside the canvas |
+| `qzone` | `0` | Additional quiet-zone in **modules** (added around the QR pattern) |
+
+#### Error correction
+
+| Query | Default | Description |
+|---|---|---|
+| `recovery` / `ecc` | `M` | `L`, `M`, `Q`, `H` — alias `ecc` compatible with goqr.me |
+
+#### Styling params
+
+| Query | Default | Options | Description |
+|---|---|---|---|
+| `style` | `square` | `square`, `rounded`, `dot`, `circle` | Body module shape |
+| `eye_style` | `square` | `square`, `rounded`, `circle` | Finder-pattern (eye) shape |
+| `gradient` | `none` | `none`, `linear`, `radial` | Gradient on body modules |
+| `gradient_from` | *(= color)* | hex / `r-g-b` | Gradient start color |
+| `gradient_to` | *(= color)* | hex / `r-g-b` | Gradient end color |
+| `gradient_angle` | `0` | 0–360 | Angle in degrees (linear only) |
+
+#### Logo params
+
+| Query | Default | Description |
+|---|---|---|
+| `logo` | *(none)* | Base64-encoded image (raw or `data:image/png;base64,...` URI) |
+| `logo_size` | `22` | Logo size as **percent** of QR (1–50) |
+| `logo_shape` | `square` | `square` or `circle` (circular crop) |
+| `logo_margin` | `2` | White safety-zone thickness in px |
+
+> When `logo` is provided, error correction is automatically forced to **High**.
 
 **Examples:**
 
 ```bash
 # Basic PNG
-GET /v1/create-qr-code?data=https://example.com&size=300x300&format=png
+GET /v1/create-qr-code?data=https://example.com&size=300x300
 
-# SVG with custom colors
-GET /v1/create-qr-code?data=Hello&format=svg&color=4ECCA3&bgcolor=1a1a2e
+# WiFi QR (no manual WIFI: string!)
+GET /v1/create-qr-code?type=wifi&ssid=HomeNet&password=secret&encryption=WPA
 
-# Rectangular with high error correction
-GET /v1/create-qr-code?data=hi&size=400x200&format=jpeg&recovery=H
+# vCard
+GET /v1/create-qr-code?type=vcard&name=John+Doe&phone=%2B6281234&email=john@example.com
 
-# Tight QR with 20px breathing room
-GET /v1/create-qr-code?data=compact&size=200x200&padding=20
+# Rounded dots, gradient, custom eye color
+GET /v1/create-qr-code?data=styled&style=dot&eye_style=circle&eye_color=ff0000&gradient=linear&gradient_from=3a1c71&gradient_to=ffaf7b
 
-# Edge-to-edge, no margin
-GET /v1/create-qr-code?data=tight&size=200x200&padding=0
+# Transparent PNG background
+GET /v1/create-qr-code?data=hi&bgcolor=transparent&format=png
 
-# With logo overlay + save
-GET /v1/create-qr-code?data=branded&format=png&logo=iVBORw0KGgo...&save
+# JSON output with dataUri (for frontend embedding)
+GET /v1/create-qr-code?data=hi&output=json
+
+# Force download with filename
+GET /v1/create-qr-code?data=hi&download=my-qr.png
+
+# SVG with circular logo, 25% size
+GET /v1/create-qr-code?data=branded&format=svg&logo=iVBORw0KGgo...&logo_size=25&logo_shape=circle
+
+# Save to history
+GET /v1/create-qr-code?data=https://example.com&save
 ```
 
-> When `logo` is provided, error correction is automatically forced to **High** for scanability.
+#### Content Types
+
+Use `type=` instead of encoding payloads manually:
+
+| `type` | Required params | Example |
+|---|---|---|
+| `text` / `url` | `data` | `?data=Hello` |
+| `wifi` | `ssid`, `encryption` (`WPA`/`WEP`/`nopass`) | `?type=wifi&ssid=Net&password=pass&encryption=WPA` |
+| `vcard` | `name` | `?type=vcard&name=Jane&phone=%2B62...` |
+| `mecard` | `name` | `?type=mecard&name=Jane&phone=...` |
+| `email` | `to` | `?type=email&to=x@y.com&subject=Hi` |
+| `tel` | `number` | `?type=tel&number=%2B6281234` |
+| `sms` | `number` | `?type=sms&number=123&message=Hello` |
+| `geo` | `lat`, `lng` | `?type=geo&lat=-6.2&lng=106.8` |
+| `event` | `title` | `?type=event&title=Launch&start=20260617T090000Z` |
+| `whatsapp` | `number` | `?type=whatsapp&number=%2B6281234&message=Hi` |
 
 ### Management Endpoints
 
@@ -203,11 +340,23 @@ These endpoints require an API key — see [API Key Management](#-api-key-manage
   "bgcolor": "#ffffff",
   "recovery": "H",
   "padding": 10,
-  "logo": "iVBORw0KGgo..."
+  "qzone": 2,
+  "logo": "iVBORw0KGgo...",
+  "logo_size": 22,
+  "logo_shape": "circle",
+  "logo_margin": 3,
+  "style": "rounded",
+  "eye_style": "circle",
+  "eye_color": "#ff0000",
+  "gradient": "linear",
+  "gradient_from": "#000000",
+  "gradient_to": "#0000ff",
+  "gradient_angle": 45
 }
 ```
 
 > Use `size` for square, or `width`/`height` for rectangular. If both are given, `width`/`height` win.
+> All styling fields (`style`, `eye_style`, `eye_color`, `gradient*`, `logo_*`) are optional and default to the same values as the stateless endpoint.
 
 **Response:**
 
@@ -333,7 +482,7 @@ Each key's rate limit and quota are enforced per-request. Keys can be revoked wi
 
 | Variable | Default | Required | Description |
 |---|---|---|---|
-| `DATABASE_URL` | (compose default) | **Yes** | PostgreSQL connection string |
+| `DATABASE_URL` | *(none)* | No¹ | PostgreSQL connection string — omit to run in stateless-only mode |
 | `PORT` | `8080` | No | Server listen port |
 | `STORAGE_DIR` | `/app/storage/qrcodes` | No | QR file storage directory |
 | `MIGRATIONS_DIR` | `./migrations` | No | Path to SQL migration files |
@@ -342,6 +491,8 @@ Each key's rate limit and quota are enforced per-request. Keys can be revoked wi
 | `RATE_LIMIT_MAX` | `30` | No | Max requests per IP per window |
 | `RATE_LIMIT_EXPIRATION` | `60s` | No | Rate limit window duration |
 | `DB_MAX_CONNS` | `20` | No | PostgreSQL connection pool max |
+¹ Required only for full mode (persistence + API key management).
+
 | `POSTGRES_USER` | `qruser` | No | (compose) DB username |
 | `POSTGRES_PASSWORD` | `qrpass` | No | (compose) DB password |
 | `POSTGRES_DB` | `qrservice` | No | (compose) DB name |
@@ -351,9 +502,54 @@ Each key's rate limit and quota are enforced per-request. Keys can be revoked wi
 
 ## 🎨 QR Features
 
+### Content Types
+
+Instead of constructing payload strings manually, set `type=` and supply structured fields. The service builds the correct encoded string for you:
+
+```bash
+# WiFi — encodes to "WIFI:T:WPA;S:MyNet;P:pass;H:false;;"
+?type=wifi&ssid=MyNet&password=pass&encryption=WPA
+
+# vCard — encodes to BEGIN:VCARD ... END:VCARD
+?type=vcard&name=Jane+Doe&phone=%2B6281234&email=jane@example.com
+
+# WhatsApp deep-link — strips spaces/dashes from number
+?type=whatsapp&number=%2B62+812-3456&message=Hello
+```
+
+### Styling Engine
+
+All styling is rendered from the raw QR bitmap — no library restrictions.
+
+**Module shapes** (`style=`):
+- `square` — classic solid squares *(default)*
+- `rounded` — squares with rounded corners
+- `dot` — small filled circles (~84% of cell)
+- `circle` — full circles
+
+**Eye (finder-pattern) styles** (`eye_style=`):
+- `square`, `rounded`, `circle`
+- Can use a separate color (`eye_color=`) to make eyes pop
+
+**Gradients** (`gradient=linear` or `gradient=radial`):
+- `gradient_from` / `gradient_to` — start and end colors
+- `gradient_angle` — rotation in degrees (linear only)
+
+```bash
+# Teal gradient, dot modules, rounded eyes
+?data=hi&style=dot&eye_style=rounded&gradient=linear&gradient_from=00d2ff&gradient_to=3a7bd5
+
+# Radial gradient in SVG (vector quality, scales infinitely)
+?data=hi&format=svg&gradient=radial&gradient_from=ffcc00&gradient_to=cc0000
+```
+
 ### Padding & Margins
 
-The `padding` parameter controls white space around the QR inside the canvas. The library's built-in quiet zone is **disabled** — you have full control.
+Two independent controls:
+- `padding` — whitespace in **pixels** inside the canvas (default 4)
+- `qzone` — quiet-zone in **modules** added around the QR pattern (default 0)
+
+The library's built-in quiet zone is disabled — you have full control.
 
 ```
 padding=0          padding=4 (default)       padding=30
@@ -370,21 +566,34 @@ edge-to-edge       thin margin               generous space
 
 Supports any image format that Go's `image` package can decode (PNG, JPEG, GIF). The logo is:
 
-- Scaled to **22%** of the QR area using Catmull-Rom interpolation
-- Centered with a **2px white safety zone** behind it
+- Scaled to `logo_size`% of the QR area using Catmull-Rom interpolation (default **22%**)
+- Cropped to a circle if `logo_shape=circle`
+- Centered with a white safety zone of `logo_margin` px (default **2px**)
 - Auto-triggers **High** error correction to keep the QR scannable
 
 The `logo` parameter accepts both raw base64 and full `data:image/png;base64,...` URIs.
 
 ```bash
-# Raw base64
+# Square logo, default size
 ?logo=iVBORw0KGgo...
 
-# Data URI (from browser / export tools)
-?logo=data:image/png;base64,iVBORw0KGgo...
+# Circular logo, 25% size, 4px safety zone
+?logo=iVBORw0KGgo...&logo_shape=circle&logo_size=25&logo_margin=4
 ```
 
 > **Tip:** For large logos, use `POST /v1/qr` with the logo in the JSON body to avoid URL length limits.
+
+### Output Modes
+
+| `output=` | Response | Use Case |
+|---|---|---|
+| `image` *(default)* | Binary image bytes | `<img src>` / curl download |
+| `base64` | JSON `{base64, dataUri}` | Lightweight frontend embed |
+| `json` | JSON `{format, mime, width, height, base64, dataUri}` | Full metadata |
+
+### ETag / 304 Caching
+
+QR output is deterministic for identical params. The API sets an `ETag` header on every response. Browsers and CDNs that send `If-None-Match` on repeat requests receive a `304 Not Modified` with no body — free bandwidth savings for hot URLs.
 
 ### WebP Support
 
@@ -414,19 +623,24 @@ brew install webp
 ```
 cmd/main.go                  — Entry point, config, server lifecycle
 internal/
-  handler/qr_handler.go      — HTTP handlers (request → response)
+  content/
+    build.go                 — Content-type payload builders (WiFi, vCard, …)
+    build_test.go
+  handler/qr_handler.go      — HTTP handlers (ETag, output modes, param parsing)
   service/
-    qr_service.go            — Business logic (QR gen, logo, encoding)
-    qr_service_test.go       — 21 unit tests
+    qr_service.go            — Business logic (QR gen, logo, encoding, color parsing)
+    render.go                — Unified raster + SVG renderer (shapes, gradients, eyes)
+    qr_service_test.go       — Unit tests (generation, styling, colors, data length)
+    render_test.go           — Renderer unit tests (shapes, gradients, transparency)
     errors.go                — Sentinel error types
   repository/
     qr_repository.go         — PostgreSQL persistence (CRUD + search/filter)
   migration/
     migrate.go               — Auto-migration runner (idempotent)
-    migrate_test.go          — Migration tests
 migrations/
   001_init.sql               — Initial schema
   002_add_dimensions.sql     — Width/height columns
+  003_add_api_keys.sql       — Per-client API keys
 ```
 
 **Tech stack:** Go 1.22 · Fiber v2 · pgx v5 · go-qrcode · slog · golang.org/x/image
