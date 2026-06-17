@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"image"
 	"os"
 	"path/filepath"
@@ -528,5 +529,146 @@ func init() {
 	_, err := base64.StdEncoding.DecodeString(testLogoBase64)
 	if err != nil {
 		panic("test logo is not valid base64: " + err.Error())
+	}
+}
+
+func TestGenerate_StyleRounded(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	result, err := svc.Generate(context.Background(), GenerateParams{
+		Data: "hello", Width: 200, Height: 200, Format: "png",
+		ModuleStyle: "rounded", EyeStyle: "rounded",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Bytes) == 0 {
+		t.Error("empty bytes")
+	}
+}
+
+func TestGenerate_StyleDot(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	result, err := svc.Generate(context.Background(), GenerateParams{
+		Data: "hello", Width: 200, Height: 200, Format: "png",
+		ModuleStyle: "dot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Bytes) == 0 {
+		t.Error("empty bytes")
+	}
+}
+
+func TestGenerate_GradientLinearPNG(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	result, err := svc.Generate(context.Background(), GenerateParams{
+		Data: "gradient", Width: 200, Height: 200, Format: "png",
+		Gradient: "linear", GradientFrom: "#ff0000", GradientTo: "#0000ff",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Bytes) == 0 {
+		t.Error("empty bytes")
+	}
+}
+
+func TestGenerate_GradientRadialSVG(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	result, err := svc.Generate(context.Background(), GenerateParams{
+		Data: "gradient-svg", Width: 200, Height: 200, Format: "svg",
+		Gradient: "radial", GradientFrom: "#ffcc00", GradientTo: "#cc0000",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(result.Bytes), "radialGradient") {
+		t.Error("expected radialGradient in SVG output")
+	}
+}
+
+func TestGenerate_TransparentBgPNG(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	result, err := svc.Generate(context.Background(), GenerateParams{
+		Data: "transparent", Width: 200, Height: 200, Format: "png",
+		BgColor: "transparent",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, _, decErr := image.Decode(bytes.NewReader(result.Bytes))
+	if decErr != nil {
+		t.Fatal(decErr)
+	}
+	// A background pixel should be transparent (alpha = 0).
+	// Use bottom-right corner which is background for a centred QR.
+	r, _, _, a := img.At(img.Bounds().Max.X-1, img.Bounds().Max.Y-1).RGBA()
+	_ = r
+	if a != 0 {
+		t.Errorf("expected transparent background pixel, got alpha %d", a>>8)
+	}
+}
+
+func TestGenerate_EyeColor(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	_, err := svc.Generate(context.Background(), GenerateParams{
+		Data: "eye", Width: 200, Height: 200, Format: "png",
+		Color: "#000000", EyeColor: "#ff0000",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGenerate_ParseColorDecimal(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	_, err := svc.Generate(context.Background(), GenerateParams{
+		Data: "decimal-color", Width: 150, Height: 150, Format: "png",
+		Color: "0-0-0", BgColor: "255-255-255",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGenerate_DataTooLong(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	bigData := strings.Repeat("A", 3000)
+	_, err := svc.Generate(context.Background(), GenerateParams{
+		Data: bigData, Width: 150, Height: 150, Format: "png",
+	})
+	if err == nil {
+		t.Fatal("expected error for data too long")
+	}
+	if !errors.Is(err, ErrDataTooLong) {
+		t.Errorf("expected ErrDataTooLong, got: %v", err)
+	}
+}
+
+func TestGenerate_LogoCircleShape(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	result, err := svc.Generate(context.Background(), GenerateParams{
+		Data: "logo-circle", Width: 300, Height: 300, Format: "png",
+		LogoBase64: testLogoBase64, LogoShape: "circle", LogoSize: 20, LogoMargin: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Bytes) == 0 {
+		t.Error("empty bytes")
+	}
+}
+
+func TestGenerate_QZone(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	result, err := svc.Generate(context.Background(), GenerateParams{
+		Data: "qzone", Width: 200, Height: 200, Format: "png", QZone: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Bytes) == 0 {
+		t.Error("empty bytes")
 	}
 }

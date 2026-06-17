@@ -7,9 +7,12 @@ import (
 
 // Sentinel errors for the QR service domain.
 var (
-	ErrInvalidFormat = errors.New("unsupported output format")
-	ErrInvalidColor  = errors.New("invalid hex color")
-	ErrInvalidSize   = errors.New("size out of valid range (1-2048)")
+	ErrInvalidFormat  = errors.New("unsupported output format")
+	ErrInvalidColor   = errors.New("invalid color value")
+	ErrInvalidSize    = errors.New("size out of valid range (1-2048)")
+	ErrInvalidContent = errors.New("invalid content parameters for the requested type")
+	ErrDataTooLong    = errors.New("data exceeds maximum QR capacity")
+	ErrNoDB           = errors.New("database not configured — run with DATABASE_URL to enable persistence")
 	ErrQRGenerate    = errors.New("QR code generation failed")
 	ErrLogoDecode    = errors.New("logo image decode failed")
 	ErrLogoBase64    = errors.New("invalid base64 logo data")

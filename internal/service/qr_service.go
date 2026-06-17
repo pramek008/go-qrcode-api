@@ -33,7 +33,22 @@ type GenerateParams struct {
 	LogoBase64    string
 	RecoveryLevel string // L, M, Q, H (default M, forced to H when logo present)
 	Padding       int    // pixels of margin around QR inside canvas (default 4)
+	QZone         int    // quiet-zone in modules added around the QR (default 0)
 	Save          bool
+
+	// Styling (rendered by the unified renderer in render.go).
+	ModuleStyle   string // square|rounded|dot|circle (default square)
+	EyeStyle      string // square|rounded|circle (default square)
+	EyeColor      string // hex/decimal; empty = same as Color
+	Gradient      string // none|linear|radial (default none)
+	GradientFrom  string // gradient start color; defaults to Color
+	GradientTo    string // gradient end color; defaults to Color
+	GradientAngle int    // linear gradient angle in degrees
+
+	// Logo styling.
+	LogoSize   int    // logo size as percent of the QR (default 22, max 50)
+	LogoShape  string // square|circle (default square)
+	LogoMargin int    // white safety-zone padding in px (default 2)
 }
 
 type GenerateResult struct {
@@ -79,13 +94,42 @@ func (s *QRService) Generate(ctx context.Context, p GenerateParams) (*GenerateRe
 		p.BgColor = "#ffffff"
 	}
 
-	fg, err := parseHexColor(p.Color)
-	if err != nil {
-		return nil, fmt.Errorf("invalid color: %w", err)
+	// Guard against payloads larger than the QR binary capacity.
+	if len(p.Data) > maxQRDataLen {
+		return nil, wrap(ErrDataTooLong, nil, "data exceeds QR capacity")
 	}
-	bg, err := parseHexColor(p.BgColor)
+
+	fg, err := parseColor(p.Color)
 	if err != nil {
-		return nil, fmt.Errorf("invalid bgcolor: %w", err)
+		return nil, err
+	}
+	bg, err := parseColor(p.BgColor)
+	if err != nil {
+		return nil, err
+	}
+	transparent := bg.A == 0
+
+	eyeCol := fg
+	if p.EyeColor != "" {
+		eyeCol, err = parseColor(p.EyeColor)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	gradient := strings.ToLower(strings.TrimSpace(p.Gradient))
+	var gFrom, gTo color.RGBA
+	if gradient == "linear" || gradient == "radial" {
+		gFrom, err = parseColor(firstNonEmpty(p.GradientFrom, p.Color))
+		if err != nil {
+			return nil, err
+		}
+		gTo, err = parseColor(firstNonEmpty(p.GradientTo, p.Color))
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		gradient = "none"
 	}
 
 	// Use High error correction if logo is present (needed for readability).
@@ -97,35 +141,105 @@ func (s *QRService) Generate(ctx context.Context, p GenerateParams) (*GenerateRe
 
 	qr, err := goqrcode.New(p.Data, recoveryLevel)
 	if err != nil {
-		return nil, fmt.Errorf("qr generation failed: %w", err)
+		return nil, wrap(ErrQRGenerate, err, "qr generation failed")
 	}
-	qr.ForegroundColor = fg
-	qr.BackgroundColor = bg
-	qr.DisableBorder = true // we control margins via the padding parameter
+	qr.DisableBorder = true // matrix has no quiet zone; we control margins ourselves
 
-	// QR pattern is always square; generate at min dimension minus padding
+	matrix := qr.Bitmap()
+	cells := len(matrix)
+	if cells == 0 {
+		return nil, wrap(ErrQRGenerate, nil, "empty qr matrix")
+	}
+
+	// --- Layout ---
+	// QR pattern is square; fit it (plus optional quiet zone modules) inside the
+	// smaller canvas dimension minus the px margin, then center on the canvas.
 	minDim := p.Width
-	if p.Height < p.Width {
+	if p.Height < minDim {
 		minDim = p.Height
 	}
-	qrSize := minDim - 2*p.Padding
-	if qrSize < 21 {
-		qrSize = 21 // minimum viable QR size
+	margin := p.Padding
+	if margin < 0 {
+		margin = 0
 	}
+	qzone := p.QZone
+	if qzone < 0 {
+		qzone = 0
+	}
+	avail := minDim - 2*margin
+	if avail < cells {
+		avail = cells
+	}
+	cellSize := avail / (cells + 2*qzone)
+	if cellSize < 1 {
+		cellSize = 1
+	}
+	qrPixels := cellSize * cells
+	offsetX := (p.Width - qrPixels) / 2
+	offsetY := (p.Height - qrPixels) / 2
+
+	opt := renderOptions{
+		Width:         p.Width,
+		Height:        p.Height,
+		CellSize:      cellSize,
+		OffsetX:       offsetX,
+		OffsetY:       offsetY,
+		FG:            fg,
+		BG:            bg,
+		EyeColor:      eyeCol,
+		Transparent:   transparent,
+		ModuleStyle:   normStyle(p.ModuleStyle, "square", "rounded", "dot", "circle"),
+		EyeStyle:      normStyle(p.EyeStyle, "square", "rounded", "circle"),
+		Gradient:      gradient,
+		GradientFrom:  gFrom,
+		GradientTo:    gTo,
+		GradientAngle: p.GradientAngle,
+	}
+
+	// Logo geometry (shared by raster and SVG paths).
+	logoPct := p.LogoSize
+	if logoPct <= 0 || logoPct > 50 {
+		logoPct = 22
+	}
+	logoSize := qrPixels * logoPct / 100
+	if logoSize < 16 {
+		logoSize = 16
+	}
+	logoMargin := p.LogoMargin
+	if logoMargin <= 0 {
+		logoMargin = 2
+	}
+	logoShape := normStyle(p.LogoShape, "square", "circle")
+	logoX := offsetX + (qrPixels-logoSize)/2
+	logoY := offsetY + (qrPixels-logoSize)/2
 
 	var rawBytes []byte
 	var mimeType string
 
 	switch p.Format {
 	case "svg":
-		rawBytes = generateSVG(qr, p.Width, p.Height, qrSize, fg, bg, p.LogoBase64)
+		svg := renderSVG(matrix, opt)
+		if p.LogoBase64 != "" {
+			logo, lerr := svgLogo(p.LogoBase64, logoX, logoY, logoSize, logoMargin, logoShape)
+			if lerr != nil {
+				return nil, lerr
+			}
+			svg = strings.Replace(svg, "</svg>", logo+"</svg>", 1)
+		}
+		rawBytes = []byte(svg)
 		mimeType = "image/svg+xml"
 	default:
-		// Raster formats: generate QR image, pad, overlay logo, encode
-		rawBytes, mimeType, err = s.encodeRaster(qr, qrSize, p)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("encoding failed: %w", err)
+		canvas := renderRaster(matrix, opt)
+		if p.LogoBase64 != "" {
+			canvas, err = overlayLogo(canvas, p.LogoBase64, logoX, logoY, logoSize, logoMargin, logoShape)
+			if err != nil {
+				return nil, err
+			}
+		}
+		rawBytes, mimeType, err = encodeImage(canvas, p.Format, transparent)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	result := &GenerateResult{Bytes: rawBytes, MimeType: mimeType}
@@ -149,7 +263,7 @@ func (s *QRService) Generate(ctx context.Context, p GenerateParams) (*GenerateRe
 			Format:    p.Format,
 			Width:     p.Width,
 			Height:    p.Height,
-			Size:      qrSize,
+			Size:      qrPixels,
 			Color:     p.Color,
 			BgColor:   p.BgColor,
 			FilePath:  filePath,
@@ -217,100 +331,143 @@ func parseRecoveryLevel(level string) goqrcode.RecoveryLevel {
 	}
 }
 
-// encodeRaster generates a raster QR image, pads it to the requested canvas
-// size, overlays a logo if present, and encodes to the target format.
-func (s *QRService) encodeRaster(qr *goqrcode.QRCode, qrSize int, p GenerateParams) ([]byte, string, error) {
-	// 1. Get QR image (always square, RGBA)
-	qrImg := qr.Image(qrSize)
+// maxQRDataLen is a safe upper bound on encodable payload length (QR binary
+// capacity is 2953 bytes at the lowest error-correction level).
+const maxQRDataLen = 2953
 
-	// 2. Pad canvas if Width != Height
-	bg, _ := parseHexColor(p.BgColor)
-	canvas := padCanvas(qrImg, p.Width, p.Height, bg)
-
-	// 3. Overlay logo if provided
-	if p.LogoBase64 != "" {
-		var err error
-		canvas, err = overlayLogo(canvas, p.LogoBase64, qrSize, p.Width, p.Height)
-		if err != nil {
-			return nil, "", fmt.Errorf("logo overlay failed: %w", err)
+// firstNonEmpty returns the first non-empty (after trimming) string.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
 		}
 	}
-
-	// 4. Encode to target format
-	return encodeImage(canvas, p.Format)
+	return ""
 }
 
-// padCanvas centers a square QR image on a larger canvas filled with bg color.
-func padCanvas(qrImg image.Image, width, height int, bg color.RGBA) *image.RGBA {
-	if width == qrImg.Bounds().Dx() && height == qrImg.Bounds().Dy() {
-		if rgba, ok := qrImg.(*image.RGBA); ok {
-			return rgba
+// normStyle lowercases v and returns it if it is one of allowed; otherwise it
+// returns allowed[0] as the default.
+func normStyle(v string, allowed ...string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	for _, a := range allowed {
+		if v == a {
+			return v
 		}
-		// Convert to RGBA
-		b := qrImg.Bounds()
-		rgba := image.NewRGBA(b)
-		draw.Draw(rgba, b, qrImg, b.Min, draw.Src)
-		return rgba
 	}
-	canvas := image.NewRGBA(image.Rect(0, 0, width, height))
-	bgUniform := image.NewUniform(bg)
-	draw.Draw(canvas, canvas.Bounds(), bgUniform, image.Point{}, draw.Src)
-	offsetX := (width - qrImg.Bounds().Dx()) / 2
-	offsetY := (height - qrImg.Bounds().Dy()) / 2
-	draw.Draw(canvas, image.Rect(offsetX, offsetY, offsetX+qrImg.Bounds().Dx(), offsetY+qrImg.Bounds().Dy()), qrImg, image.Point{}, draw.Over)
-	return canvas
+	return allowed[0]
 }
 
-// overlayLogo decodes a base64 logo (optionally prefixed with a data URI like
-// "data:image/png;base64,..."), scales it, and overlays it centered on the canvas
-// with a white safety zone behind it.
-func overlayLogo(canvas *image.RGBA, logoBase64 string, qrSize, canvasW, canvasH int) (*image.RGBA, error) {
+// parseColor accepts hex ("#rgb"/"#rrggbb"), decimal ("r-g-b"), or the keyword
+// "transparent"/"none" (returns a zero-alpha color). Failures are wrapped with
+// ErrInvalidColor so callers can map them to HTTP 400.
+func parseColor(s string) (color.RGBA, error) {
+	t := strings.ToLower(strings.TrimSpace(s))
+	if t == "transparent" || t == "none" {
+		return color.RGBA{}, nil // alpha 0
+	}
+	if strings.Contains(t, "-") {
+		parts := strings.Split(t, "-")
+		if len(parts) == 3 {
+			r, e1 := strconv.Atoi(parts[0])
+			g, e2 := strconv.Atoi(parts[1])
+			b, e3 := strconv.Atoi(parts[2])
+			if e1 == nil && e2 == nil && e3 == nil &&
+				inByteRange(r) && inByteRange(g) && inByteRange(b) {
+				return color.RGBA{R: uint8(r), G: uint8(g), B: uint8(b), A: 255}, nil
+			}
+		}
+		return color.RGBA{}, wrap(ErrInvalidColor, nil, "invalid decimal color")
+	}
+	c, err := parseHexColor(s)
+	if err != nil {
+		return color.RGBA{}, wrap(ErrInvalidColor, err, "invalid hex color")
+	}
+	return c, nil
+}
+
+func inByteRange(v int) bool { return v >= 0 && v <= 255 }
+
+// overlayLogo decodes a base64 logo (optionally prefixed with a data URI),
+// scales it to logoSize, optionally crops it to a circle, and draws it at
+// (logoX,logoY) over a white safety zone of `margin` px. Decode failures are
+// wrapped with ErrLogoDecode for HTTP 400 mapping.
+func overlayLogo(canvas *image.RGBA, logoBase64 string, logoX, logoY, logoSize, margin int, shape string) (*image.RGBA, error) {
 	data, err := decodeLogoBase64(logoBase64)
 	if err != nil {
-		return nil, err
+		return nil, wrap(ErrLogoBase64, err, "invalid logo data")
 	}
 	logoImg, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("unsupported logo image format: %w", err)
+		return nil, wrap(ErrLogoDecode, err, "unsupported logo image format")
 	}
 
-	// Logo size = ~22% of QR pattern size
-	logoSize := int(float64(qrSize) * 0.22)
-	if logoSize < 16 {
-		logoSize = 16
-	}
-
-	// Scale logo
+	// Scale logo to the target box.
 	scaledLogo := image.NewRGBA(image.Rect(0, 0, logoSize, logoSize))
 	xdraw.CatmullRom.Scale(scaledLogo, scaledLogo.Bounds(), logoImg, logoImg.Bounds(), draw.Over, nil)
 
-	// Position: center of canvas
-	logoX := (canvasW - logoSize) / 2
-	logoY := (canvasH - logoSize) / 2
+	if shape == "circle" {
+		scaledLogo = circleCrop(scaledLogo, logoSize)
+	}
 
-	// White safety zone (2px padding)
-	safetyPad := 2
-	safetyRect := image.Rect(
-		logoX-safetyPad,
-		logoY-safetyPad,
-		logoX+logoSize+safetyPad,
-		logoY+logoSize+safetyPad,
-	)
-	draw.Draw(canvas, safetyRect, image.NewUniform(color.White), image.Point{}, draw.Src)
+	// White safety zone behind the logo (matches the logo shape).
+	cx, cy := logoX+logoSize/2, logoY+logoSize/2
+	if shape == "circle" {
+		drawFilledCircle(canvas, cx, cy, logoSize/2+margin, color.RGBA{255, 255, 255, 255})
+	} else {
+		safety := image.Rect(logoX-margin, logoY-margin, logoX+logoSize+margin, logoY+logoSize+margin)
+		draw.Draw(canvas, safety, image.NewUniform(color.White), image.Point{}, draw.Src)
+	}
 
-	// Draw logo
+	// Draw the logo.
 	logoRect := image.Rect(logoX, logoY, logoX+logoSize, logoY+logoSize)
 	draw.Draw(canvas, logoRect, scaledLogo, image.Point{}, draw.Over)
-
 	return canvas, nil
 }
 
-// encodeImage encodes an RGBA image to the target format bytes.
-func encodeImage(img *image.RGBA, format string) ([]byte, string, error) {
+// circleCrop returns a copy of src with pixels outside the inscribed circle
+// made fully transparent.
+func circleCrop(src *image.RGBA, size int) *image.RGBA {
+	out := image.NewRGBA(src.Bounds())
+	r := float64(size) / 2
+	cx, cy := r-0.5, r-0.5
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			dx, dy := float64(x)-cx, float64(y)-cy
+			if dx*dx+dy*dy <= r*r {
+				out.SetRGBA(x, y, src.RGBAAt(x, y))
+			}
+		}
+	}
+	return out
+}
+
+// drawFilledCircle fills a disc of radius r centered at (cx,cy) with col.
+func drawFilledCircle(img *image.RGBA, cx, cy, r int, col color.RGBA) {
+	for y := cy - r; y <= cy+r; y++ {
+		for x := cx - r; x <= cx+r; x++ {
+			dx, dy := x-cx, y-cy
+			if dx*dx+dy*dy <= r*r {
+				img.SetRGBA(x, y, col)
+			}
+		}
+	}
+}
+
+// encodeImage encodes an RGBA image to the target format bytes. When the image
+// has transparent regions and the format cannot store alpha (JPEG), it is
+// flattened onto a white background first.
+func encodeImage(img *image.RGBA, format string, transparent bool) ([]byte, string, error) {
 	var buf bytes.Buffer
 	switch format {
 	case "jpeg", "jpg":
-		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90}); err != nil {
+		src := img
+		if transparent {
+			flat := image.NewRGBA(img.Bounds())
+			draw.Draw(flat, flat.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+			draw.Draw(flat, flat.Bounds(), img, img.Bounds().Min, draw.Over)
+			src = flat
+		}
+		if err := jpeg.Encode(&buf, src, &jpeg.Options{Quality: 90}); err != nil {
 			return nil, "", err
 		}
 		return buf.Bytes(), "image/jpeg", nil
@@ -408,57 +565,31 @@ func decodeLogoBase64(raw string) ([]byte, error) {
 	return nil, fmt.Errorf("invalid base64 logo: %w", err)
 }
 
-func generateSVG(qr *goqrcode.QRCode, width, height, qrSize int, fg, bg color.RGBA, logoBase64 string) []byte {
-	bitmap := qr.Bitmap()
-	cells := len(bitmap)
-	if cells == 0 {
-		return []byte{}
+// svgLogo builds the SVG snippet for a logo overlay (safety zone + image element).
+// It returns an error if the base64 string is undecodable so the caller can 400.
+func svgLogo(logoBase64 string, lx, ly, logoSize, margin int, shape string) (string, error) {
+	// Validate the base64 is actually decodable (catches bad input early).
+	if _, err := decodeLogoBase64(logoBase64); err != nil {
+		return "", wrap(ErrLogoBase64, err, "invalid logo data")
 	}
-	cellSize := qrSize / cells
-
-	// Offset to center QR on canvas
-	offsetX := (width - qrSize) / 2
-	offsetY := (height - qrSize) / 2
-
+	cleanLogo := logoBase64
+	if idx := strings.Index(cleanLogo, ";base64,"); idx != -1 {
+		cleanLogo = cleanLogo[idx+len(";base64,"):]
+	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d">`,
-		width, height, width, height))
-	// Background
-	sb.WriteString(fmt.Sprintf(`<rect width="%d" height="%d" fill="rgb(%d,%d,%d)"/>`,
-		width, height, bg.R, bg.G, bg.B))
-
-	// QR modules
-	for y, row := range bitmap {
-		for x, cell := range row {
-			if cell {
-				sb.WriteString(fmt.Sprintf(`<rect x="%d" y="%d" width="%d" height="%d" fill="rgb(%d,%d,%d)"/>`,
-					offsetX+x*cellSize, offsetY+y*cellSize, cellSize, cellSize, fg.R, fg.G, fg.B))
-			}
-		}
-	}
-
-	// Logo overlay (SVG)
-	if logoBase64 != "" {
-		logoSize := int(float64(qrSize) * 0.22)
-		if logoSize < 16 {
-			logoSize = 16
-		}
-		lx := offsetX + (qrSize-logoSize)/2
-		ly := offsetY + (qrSize-logoSize)/2
-		// White safety zone
-		safetyPad := 2
+	if shape == "circle" {
+		cx, cy := lx+logoSize/2, ly+logoSize/2
+		r := logoSize/2 + margin
+		clipID := fmt.Sprintf("logoClip%d", lx)
+		sb.WriteString(fmt.Sprintf(`<defs><clipPath id="%s"><circle cx="%d" cy="%d" r="%d"/></clipPath></defs>`, clipID, cx, cy, logoSize/2))
+		sb.WriteString(fmt.Sprintf(`<circle cx="%d" cy="%d" r="%d" fill="white"/>`, cx, cy, r))
+		sb.WriteString(fmt.Sprintf(`<image x="%d" y="%d" width="%d" height="%d" href="data:image/png;base64,%s" clip-path="url(#%s)"/>`,
+			lx, ly, logoSize, logoSize, cleanLogo, clipID))
+	} else {
 		sb.WriteString(fmt.Sprintf(`<rect x="%d" y="%d" width="%d" height="%d" fill="white"/>`,
-			lx-safetyPad, ly-safetyPad, logoSize+safetyPad*2, logoSize+safetyPad*2))
-		// Strip data URI prefix if present, we'll add our own
-		cleanLogo := logoBase64
-		if idx := strings.Index(cleanLogo, ";base64,"); idx != -1 {
-			cleanLogo = cleanLogo[idx+len(";base64,"):]
-		}
-		// Logo image (data URI)
+			lx-margin, ly-margin, logoSize+margin*2, logoSize+margin*2))
 		sb.WriteString(fmt.Sprintf(`<image x="%d" y="%d" width="%d" height="%d" href="data:image/png;base64,%s"/>`,
 			lx, ly, logoSize, logoSize, cleanLogo))
 	}
-
-	sb.WriteString(`</svg>`)
-	return []byte(sb.String())
+	return sb.String(), nil
 }
