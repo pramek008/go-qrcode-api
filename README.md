@@ -200,9 +200,7 @@ Or run without Docker at all (see [Local Development](#-local-development)).
 
 ### Try in this Playground
 
-```
 https://ekanovation.my.id/tools/qr-service
-```
 
 ### You can try with this base url
 ```
