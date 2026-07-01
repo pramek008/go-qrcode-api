@@ -198,6 +198,12 @@ Or run without Docker at all (see [Local Development](#-local-development)).
 
 ## 📡 API Reference
 
+### Try in this Playground
+
+```
+https://ekanovation.my.id/tools/qr-service
+```
+
 ### You can try with this base url
 ```
 https://qrcode.ekanovation.my.id
