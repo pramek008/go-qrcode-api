@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
@@ -37,7 +40,8 @@ func (h *QRHandler) CreateQR(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "data parameter is required"})
 	}
 
-	p := parseStatelessParams(c, payload)
+	p := parseParams(queryGetter(c), payload)
+	_, p.Save = c.Queries()["save"]
 
 	// ETag: deterministic hash over all normalised params.
 	etag := `"` + etagHash(p, c.Query("format", "png"), c.Query("output", "image")) + `"`
@@ -51,7 +55,49 @@ func (h *QRHandler) CreateQR(c *fiber.Ctx) error {
 		return errResp(c, classifyErr(err), err)
 	}
 
-	return sendResult(c, result, c.Query("output", "image"), c.Query("download", ""))
+	return sendResult(c, result, c.Query("output", "image"), c.Query("download", ""), "public, max-age=3600")
+}
+
+// POST /v1/create-qr-code — stateless generation with a request body, so a logo
+// can be sent as a file (multipart/form-data) or base64 (application/json)
+// without hitting URL length limits. Nothing is stored: the image is rendered
+// in memory and streamed back.
+func (h *QRHandler) CreateQRPost(c *fiber.Ctx) error {
+	fields, logoFile, err := parseBodyFields(c)
+	if err != nil {
+		status := 400
+		if errors.Is(err, service.ErrLogoTooLarge) {
+			status = 413
+		}
+		return errResp(c, status, err)
+	}
+	_, saveInQuery := c.Queries()["save"]
+	if _, saveInBody := fields["save"]; saveInBody || saveInQuery {
+		return c.Status(400).JSON(fiber.Map{"error": "save is not supported on this endpoint; it is stateless"})
+	}
+
+	typ := fields["type"]
+	if typ == "" {
+		typ = "text"
+	}
+	payload, err := content.Build(typ, fields)
+	if err != nil {
+		return errResp(c, 400, err)
+	}
+	if payload == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "data parameter is required"})
+	}
+
+	p := parseParams(mapGetter(fields), payload)
+	if logoFile != nil {
+		p.LogoBase64 = base64.StdEncoding.EncodeToString(logoFile)
+	}
+
+	result, err := h.svc.Generate(c.Context(), p)
+	if err != nil {
+		return errResp(c, classifyErr(err), err)
+	}
+	return sendResult(c, result, fields["output"], fields["download"], "no-store")
 }
 
 // POST /v1/qr — generate + always save (authenticated)
@@ -253,76 +299,145 @@ func (h *QRHandler) DeleteQR(c *fiber.Ctx) error {
 
 // --- helpers ---
 
-// parseStatelessParams reads all query params for the stateless endpoint.
-func parseStatelessParams(c *fiber.Ctx, payload string) service.GenerateParams {
-	width, height := parseSize(c.Query("size", "150x150"))
-	if v, _ := strconv.Atoi(c.Query("width", "")); v > 0 {
+// paramGetter reads a named parameter, returning def when it is missing or empty.
+type paramGetter func(key, def string) string
+
+func queryGetter(c *fiber.Ctx) paramGetter {
+	return func(key, def string) string { return c.Query(key, def) }
+}
+
+func mapGetter(m map[string]string) paramGetter {
+	return func(key, def string) string {
+		if v := m[key]; v != "" {
+			return v
+		}
+		return def
+	}
+}
+
+// parseParams builds generation parameters from query params (GET) or body
+// fields (POST). Save and a body-uploaded logo are handled by the callers.
+func parseParams(get paramGetter, payload string) service.GenerateParams {
+	width, height := parseSize(get("size", "150x150"))
+	if v, _ := strconv.Atoi(get("width", "")); v > 0 {
 		width = v
 	}
-	if v, _ := strconv.Atoi(c.Query("height", "")); v > 0 {
+	if v, _ := strconv.Atoi(get("height", "")); v > 0 {
 		height = v
 	}
 
-	colorStr := "#" + strings.TrimPrefix(c.Query("color", "000000"), "#")
-	bgStr := c.Query("bgcolor", "ffffff")
+	colorStr := "#" + strings.TrimPrefix(get("color", "000000"), "#")
+	bgStr := get("bgcolor", "ffffff")
 	if strings.EqualFold(bgStr, "transparent") || strings.EqualFold(bgStr, "none") {
 		bgStr = "transparent"
 	} else {
 		bgStr = "#" + strings.TrimPrefix(bgStr, "#")
 	}
 
-	recovery := c.Query("ecc", c.Query("recovery", "M"))
+	recovery := get("ecc", get("recovery", "M"))
 
 	padding := 4
-	if v, err := strconv.Atoi(c.Query("padding", c.Query("margin", ""))); err == nil && v >= 0 {
+	if v, err := strconv.Atoi(get("padding", get("margin", ""))); err == nil && v >= 0 {
 		padding = v
 	}
 	qzone := 0
-	if v, err := strconv.Atoi(c.Query("qzone", "")); err == nil && v >= 0 {
+	if v, err := strconv.Atoi(get("qzone", "")); err == nil && v >= 0 {
 		qzone = v
 	}
 	logoSize := 0
-	if v, err := strconv.Atoi(c.Query("logo_size", "")); err == nil && v > 0 {
+	if v, err := strconv.Atoi(get("logo_size", "")); err == nil && v > 0 {
 		logoSize = v
 	}
 	logoMargin := 0
-	if v, err := strconv.Atoi(c.Query("logo_margin", "")); err == nil && v >= 0 {
+	if v, err := strconv.Atoi(get("logo_margin", "")); err == nil && v >= 0 {
 		logoMargin = v
 	}
 	gradientAngle := 0
-	if v, err := strconv.Atoi(c.Query("gradient_angle", "")); err == nil {
+	if v, err := strconv.Atoi(get("gradient_angle", "")); err == nil {
 		gradientAngle = v
 	}
-	_, save := c.Queries()["save"]
 
 	return service.GenerateParams{
 		Data:          payload,
 		Width:         width,
 		Height:        height,
-		Format:        c.Query("format", "png"),
+		Format:        get("format", "png"),
 		Color:         colorStr,
 		BgColor:       bgStr,
-		LogoBase64:    c.Query("logo", ""),
+		LogoBase64:    get("logo", ""),
 		RecoveryLevel: recovery,
 		Padding:       padding,
 		QZone:         qzone,
-		Save:          save,
-		ModuleStyle:   c.Query("style", "square"),
-		EyeStyle:      c.Query("eye_style", "square"),
-		EyeColor:      c.Query("eye_color", ""),
-		Gradient:      c.Query("gradient", "none"),
-		GradientFrom:  c.Query("gradient_from", ""),
-		GradientTo:    c.Query("gradient_to", ""),
+		ModuleStyle:   get("style", "square"),
+		EyeStyle:      get("eye_style", "square"),
+		EyeColor:      get("eye_color", ""),
+		Gradient:      get("gradient", "none"),
+		GradientFrom:  get("gradient_from", ""),
+		GradientTo:    get("gradient_to", ""),
 		GradientAngle: gradientAngle,
 		LogoSize:      logoSize,
-		LogoShape:     c.Query("logo_shape", "square"),
+		LogoShape:     get("logo_shape", "square"),
 		LogoMargin:    logoMargin,
 	}
 }
 
+// parseBodyFields flattens a JSON or multipart body into a string map. For
+// multipart requests, the "logo" file part is returned separately as raw bytes.
+func parseBodyFields(c *fiber.Ctx) (map[string]string, []byte, error) {
+	fields := map[string]string{}
+	ctype := strings.ToLower(c.Get("Content-Type"))
+
+	if strings.HasPrefix(ctype, "multipart/form-data") {
+		form, err := c.MultipartForm()
+		if err != nil {
+			return nil, nil, errors.New("invalid multipart body")
+		}
+		for k, v := range form.Value {
+			if len(v) > 0 {
+				fields[k] = strings.TrimSpace(v[0])
+			}
+		}
+		var logo []byte
+		if files := form.File["logo"]; len(files) > 0 {
+			f, err := files[0].Open()
+			if err != nil {
+				return nil, nil, errors.New("could not read logo file")
+			}
+			defer f.Close()
+			// Read one byte past the cap so an oversized file is detected, not truncated.
+			logo, err = io.ReadAll(io.LimitReader(f, service.MaxLogoBytes+1))
+			if err != nil {
+				return nil, nil, errors.New("could not read logo file")
+			}
+			if len(logo) > service.MaxLogoBytes {
+				return nil, nil, service.ErrLogoTooLarge
+			}
+		}
+		return fields, logo, nil
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(c.Body()))
+	dec.UseNumber()
+	var raw map[string]any
+	if err := dec.Decode(&raw); err != nil {
+		return nil, nil, errors.New("invalid request body: send JSON or multipart/form-data")
+	}
+	for k, v := range raw {
+		switch t := v.(type) {
+		case string:
+			fields[k] = strings.TrimSpace(t)
+		case json.Number:
+			fields[k] = t.String()
+		case bool:
+			fields[k] = strconv.FormatBool(t)
+		}
+	}
+	return fields, nil, nil
+}
+
 // sendResult writes the generation result as image bytes, base64, or JSON.
-func sendResult(c *fiber.Ctx, result *service.GenerateResult, output, download string) error {
-	c.Set("Cache-Control", "public, max-age=3600")
+func sendResult(c *fiber.Ctx, result *service.GenerateResult, output, download, cacheControl string) error {
+	c.Set("Cache-Control", cacheControl)
 
 	if download != "" {
 		c.Set("Content-Disposition", "attachment; filename="+download)
@@ -381,6 +496,8 @@ func classifyErr(err error) int {
 		errors.Is(err, service.ErrLogoBase64),
 		errors.Is(err, service.ErrLogoDecode):
 		return 400
+	case errors.Is(err, service.ErrLogoTooLarge):
+		return 413
 	case errors.Is(err, service.ErrNoDB):
 		return 503
 	default:

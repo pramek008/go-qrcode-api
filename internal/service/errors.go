@@ -16,6 +16,7 @@ var (
 	ErrQRGenerate    = errors.New("QR code generation failed")
 	ErrLogoDecode    = errors.New("logo image decode failed")
 	ErrLogoBase64    = errors.New("invalid base64 logo data")
+	ErrLogoTooLarge  = errors.New("logo image is too large")
 	ErrWebPEncode    = errors.New("WebP encoding failed — is cwebp installed?")
 	ErrFileWrite     = errors.New("failed to write QR file to storage")
 	ErrFileRead      = errors.New("failed to read stored QR file")

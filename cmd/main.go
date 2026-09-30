@@ -38,7 +38,14 @@ type Config struct {
 		Expiration time.Duration
 	}
 	DBMaxConns int
+
+	// Limits for POST /v1/create-qr-code, which accepts uploads and renders logos.
+	PostRateLimitMax  int // requests per IP per RateLimit.Expiration window
+	PostMaxConcurrent int // renders allowed at the same time before answering 503
 }
+
+// maxBodyBytes caps request bodies. A 2MB logo sent as base64 is ~2.8MB.
+const maxBodyBytes = 3 * 1024 * 1024
 
 func loadConfig() Config {
 	cfg := Config{
@@ -49,6 +56,9 @@ func loadConfig() Config {
 		AdminKey:      os.Getenv("ADMIN_KEY"),
 		CORSOrigins:   getEnv("CORS_ORIGINS", "*"),
 		DBMaxConns:    getEnvInt("DB_MAX_CONNS", 20),
+
+		PostRateLimitMax:  getEnvInt("POST_RATE_LIMIT_MAX", 20),
+		PostMaxConcurrent: getEnvInt("POST_MAX_CONCURRENT", 4),
 	}
 	cfg.RateLimit.Max = getEnvInt("RATE_LIMIT_MAX", 30)
 	cfg.RateLimit.Expiration = getEnvDuration("RATE_LIMIT_EXPIRATION", 60*time.Second)
@@ -77,6 +87,7 @@ func main() {
 	app := fiber.New(fiber.Config{
 		AppName:      "QR Service",
 		ErrorHandler: customErrorHandler,
+		BodyLimit:    maxBodyBytes,
 	})
 
 	app.Use(recover.New())
@@ -169,8 +180,7 @@ func registerFullMode(app *fiber.App, cfg Config) {
 	apiKeySvc := service.NewApiKeyService(apiKeyRepo)
 	apiKeyHandler := handler.NewApiKeyHandler(apiKeySvc)
 
-	v1 := app.Group("/v1")
-	v1.Get("/create-qr-code", qrHandler.CreateQR)
+	registerGenerateRoutes(app, qrHandler, cfg)
 
 	mgmt := app.Group("/v1/qr")
 	mgmt.Use(apiKeyAuth(apiKeySvc))
@@ -230,8 +240,7 @@ func registerStatelessMode(app *fiber.App, cfg Config) {
 	qrSvc := service.New(service.NoopRepo(), cfg.StorageDir)
 	qrHandler := handler.New(qrSvc)
 
-	v1 := app.Group("/v1")
-	v1.Get("/create-qr-code", qrHandler.CreateQR)
+	registerGenerateRoutes(app, qrHandler, cfg)
 
 	// Management + admin routes return 503 with a clear message.
 	unavailable := func(c *fiber.Ctx) error {
@@ -250,6 +259,47 @@ func registerStatelessMode(app *fiber.App, cfg Config) {
 	app.Get("/metrics", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"mode": "stateless", "db": nil})
 	})
+}
+
+// registerGenerateRoutes wires the stateless generation endpoints, shared by
+// both run modes. POST is heavier (uploads + logo rendering), so it gets its own
+// stricter rate limit and a cap on concurrent renders. Nothing is written to disk.
+func registerGenerateRoutes(app *fiber.App, qrHandler *handler.QRHandler, cfg Config) {
+	v1 := app.Group("/v1")
+	v1.Get("/create-qr-code", qrHandler.CreateQR)
+	v1.Post("/create-qr-code",
+		limiter.New(limiter.Config{
+			Max:        cfg.PostRateLimitMax,
+			Expiration: cfg.RateLimit.Expiration,
+			KeyGenerator: func(c *fiber.Ctx) string {
+				return c.IP()
+			},
+			LimitReached: func(c *fiber.Ctx) error {
+				return c.Status(429).JSON(fiber.Map{"error": "too many uploads, please wait a moment and try again"})
+			},
+		}),
+		concurrencyLimit(cfg.PostMaxConcurrent),
+		qrHandler.CreateQRPost,
+	)
+}
+
+// concurrencyLimit answers 503 when more than max requests are already being
+// processed, instead of queueing work and exhausting memory or CPU.
+func concurrencyLimit(max int) fiber.Handler {
+	if max <= 0 {
+		return func(c *fiber.Ctx) error { return c.Next() }
+	}
+	slots := make(chan struct{}, max)
+	return func(c *fiber.Ctx) error {
+		select {
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
+			return c.Next()
+		default:
+			c.Set("Retry-After", "2")
+			return c.Status(503).JSON(fiber.Map{"error": "server is busy, please try again in a moment"})
+		}
+	}
 }
 
 // --- Middleware ---

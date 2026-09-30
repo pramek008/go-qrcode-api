@@ -8,8 +8,10 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	_ "image/gif" // register GIF decoder for logo uploads
 	"image/jpeg"
 	"image/png"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +23,7 @@ import (
 	"github.com/google/uuid"
 	goqrcode "github.com/skip2/go-qrcode"
 	xdraw "golang.org/x/image/draw"
+	_ "golang.org/x/image/webp" // register WebP decoder for logo uploads
 )
 
 type GenerateParams struct {
@@ -97,6 +100,13 @@ func (s *QRService) Generate(ctx context.Context, p GenerateParams) (*GenerateRe
 	// Guard against payloads larger than the QR binary capacity.
 	if len(p.Data) > maxQRDataLen {
 		return nil, wrap(ErrDataTooLong, nil, "data exceeds QR capacity")
+	}
+
+	// Reject oversized or undecodable logos before doing any rendering work.
+	if p.LogoBase64 != "" {
+		if _, err := validateLogo(p.LogoBase64); err != nil {
+			return nil, err
+		}
 	}
 
 	fg, err := parseColor(p.Color)
@@ -565,12 +575,38 @@ func decodeLogoBase64(raw string) ([]byte, error) {
 	return nil, fmt.Errorf("invalid base64 logo: %w", err)
 }
 
+const (
+	MaxLogoBytes = 2 << 20 // decoded logo file size cap
+	maxLogoDim   = 2048    // logo width/height cap in px (guards against decompression bombs)
+)
+
+// validateLogo decodes the base64 logo and checks size, dimensions and format
+// without fully decoding the pixels. It returns the detected MIME type.
+func validateLogo(raw string) (string, error) {
+	data, err := decodeLogoBase64(raw)
+	if err != nil {
+		return "", wrap(ErrLogoBase64, err, "invalid logo data")
+	}
+	if len(data) > MaxLogoBytes {
+		return "", wrap(ErrLogoTooLarge, nil, "logo must be 2MB or smaller")
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return "", wrap(ErrLogoDecode, err, "unsupported logo image format")
+	}
+	if cfg.Width > maxLogoDim || cfg.Height > maxLogoDim {
+		return "", wrap(ErrLogoTooLarge, nil, "logo dimensions must be 2048x2048 or smaller")
+	}
+	return http.DetectContentType(data), nil
+}
+
 // svgLogo builds the SVG snippet for a logo overlay (safety zone + image element).
 // It returns an error if the base64 string is undecodable so the caller can 400.
 func svgLogo(logoBase64 string, lx, ly, logoSize, margin int, shape string) (string, error) {
-	// Validate the base64 is actually decodable (catches bad input early).
-	if _, err := decodeLogoBase64(logoBase64); err != nil {
-		return "", wrap(ErrLogoBase64, err, "invalid logo data")
+	// Validate the logo is a real, reasonably sized image and learn its MIME type.
+	mime, err := validateLogo(logoBase64)
+	if err != nil {
+		return "", err
 	}
 	cleanLogo := logoBase64
 	if idx := strings.Index(cleanLogo, ";base64,"); idx != -1 {
@@ -583,13 +619,13 @@ func svgLogo(logoBase64 string, lx, ly, logoSize, margin int, shape string) (str
 		clipID := fmt.Sprintf("logoClip%d", lx)
 		sb.WriteString(fmt.Sprintf(`<defs><clipPath id="%s"><circle cx="%d" cy="%d" r="%d"/></clipPath></defs>`, clipID, cx, cy, logoSize/2))
 		sb.WriteString(fmt.Sprintf(`<circle cx="%d" cy="%d" r="%d" fill="white"/>`, cx, cy, r))
-		sb.WriteString(fmt.Sprintf(`<image x="%d" y="%d" width="%d" height="%d" href="data:image/png;base64,%s" clip-path="url(#%s)"/>`,
-			lx, ly, logoSize, logoSize, cleanLogo, clipID))
+		sb.WriteString(fmt.Sprintf(`<image x="%d" y="%d" width="%d" height="%d" href="data:%s;base64,%s" clip-path="url(#%s)"/>`,
+			lx, ly, logoSize, logoSize, mime, cleanLogo, clipID))
 	} else {
 		sb.WriteString(fmt.Sprintf(`<rect x="%d" y="%d" width="%d" height="%d" fill="white"/>`,
 			lx-margin, ly-margin, logoSize+margin*2, logoSize+margin*2))
-		sb.WriteString(fmt.Sprintf(`<image x="%d" y="%d" width="%d" height="%d" href="data:image/png;base64,%s"/>`,
-			lx, ly, logoSize, logoSize, cleanLogo))
+		sb.WriteString(fmt.Sprintf(`<image x="%d" y="%d" width="%d" height="%d" href="data:%s;base64,%s"/>`,
+			lx, ly, logoSize, logoSize, mime, cleanLogo))
 	}
 	return sb.String(), nil
 }

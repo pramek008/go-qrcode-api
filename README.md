@@ -302,6 +302,25 @@ GET /v1/create-qr-code?data=branded&format=svg&logo=iVBORw0KGgo...&logo_size=25&
 GET /v1/create-qr-code?data=https://example.com&save
 ```
 
+#### Logo upload via POST (stateless)
+
+Base64 logos are too long for a URL. `POST /v1/create-qr-code` takes the same parameters as fields in a request body and returns the image directly. **Nothing is stored** — the QR is rendered in memory and streamed back, in both stateless and full mode. `save` is rejected with 400.
+
+```bash
+# Logo as a file (multipart/form-data) — recommended
+curl -X POST https://qrcode.example.com/v1/create-qr-code \
+  -F data=https://example.com -F logo=@logo.png -F logo_shape=circle -F style=dot \
+  -o qr.png
+
+# Logo as base64 (application/json)
+curl -X POST https://qrcode.example.com/v1/create-qr-code \
+  -H 'Content-Type: application/json' \
+  -d '{"data":"https://example.com","logo":"iVBORw0KGgo...","logo_size":25,"format":"svg"}' \
+  -o qr.svg
+```
+
+Limits: logo ≤ 2 MB and ≤ 2048×2048 px (PNG, JPEG, GIF or WebP) → `413` if exceeded; request body ≤ 3 MB; stricter rate limit than GET (`POST_RATE_LIMIT_MAX`) → `429`; at most `POST_MAX_CONCURRENT` renders at once, otherwise `503` with `Retry-After`. Responses are `Cache-Control: no-store`.
+
 #### Content Types
 
 Use `type=` instead of encoding payloads manually:
@@ -494,6 +513,8 @@ Each key's rate limit and quota are enforced per-request. Keys can be revoked wi
 | `CORS_ORIGINS` | `*` | No | Comma-separated allowed origins |
 | `RATE_LIMIT_MAX` | `30` | No | Max requests per IP per window |
 | `RATE_LIMIT_EXPIRATION` | `60s` | No | Rate limit window duration |
+| `POST_RATE_LIMIT_MAX` | `10` | No | Max `POST /v1/create-qr-code` requests per IP per window |
+| `POST_MAX_CONCURRENT` | `4` | No | Max simultaneous POST renders before answering 503 (`0` = unlimited) |
 | `DB_MAX_CONNS` | `20` | No | PostgreSQL connection pool max |
 ¹ Required only for full mode (persistence + API key management).
 
