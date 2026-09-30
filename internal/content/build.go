@@ -219,15 +219,58 @@ func buildEvent(q map[string]string) (string, error) {
 }
 
 func buildWhatsApp(q map[string]string) (string, error) {
-	num, err := require(q, "number")
+	raw, err := require(q, "number")
 	if err != nil {
 		return "", err
 	}
-	// wa.me expects digits only (no +, spaces or dashes).
-	num = strings.NewReplacer("+", "", " ", "", "-", "", "(", "", ")", "").Replace(num)
+	num, err := normalizeWhatsAppNumber(raw, q["country"])
+	if err != nil {
+		return "", err
+	}
 	out := "https://wa.me/" + num
 	if msg := strings.TrimSpace(q["message"]); msg != "" {
-		out += "?text=" + url.QueryEscape(msg)
+		// wa.me reads %20 reliably; QueryEscape would turn spaces into "+".
+		out += "?text=" + strings.ReplaceAll(url.QueryEscape(msg), "+", "%20")
 	}
 	return out, nil
+}
+
+// normalizeWhatsAppNumber returns the digits-only international number wa.me
+// requires (country code first, no +, 0 or 00 prefix). A local number that
+// starts with a single 0 gets the default country code (62, Indonesia) unless
+// a "country" field overrides it.
+func normalizeWhatsAppNumber(raw, country string) (string, error) {
+	var digits strings.Builder
+	for _, r := range raw {
+		if r >= '0' && r <= '9' {
+			digits.WriteRune(r)
+		}
+	}
+	num := digits.String()
+
+	switch {
+	case strings.HasPrefix(num, "00"): // 0062... international dialing prefix
+		num = strings.TrimLeft(num, "0")
+	case strings.HasPrefix(num, "0"): // 0812... local format
+		cc := strings.TrimLeft(onlyDigits(country), "0")
+		if cc == "" {
+			cc = "62"
+		}
+		num = cc + strings.TrimLeft(num, "0")
+	}
+
+	if len(num) < 8 || len(num) > 15 {
+		return "", fmt.Errorf("%w: whatsapp number must be 8-15 digits including country code", ErrInvalidContent)
+	}
+	return num, nil
+}
+
+func onlyDigits(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

@@ -66,7 +66,12 @@ func TestBuild_Simple(t *testing.T) {
 		{"sms", map[string]string{"number": "123", "message": "hi"}, "SMSTO:123:hi"},
 		{"geo", map[string]string{"lat": "1.5", "lng": "2.5"}, "geo:1.5,2.5"},
 		{"email", map[string]string{"to": "a@b.com"}, "mailto:a@b.com"},
-		{"whatsapp", map[string]string{"number": "+62 812-3"}, "https://wa.me/628123"},
+		{"whatsapp", map[string]string{"number": "+62 812-3456"}, "https://wa.me/628123456"},
+		{"whatsapp", map[string]string{"number": "0812-3456-7890"}, "https://wa.me/6281234567890"},
+		{"whatsapp", map[string]string{"number": "(0812) 3456.7890"}, "https://wa.me/6281234567890"},
+		{"whatsapp", map[string]string{"number": "0062 812 3456"}, "https://wa.me/628123456"},
+		{"whatsapp", map[string]string{"number": "0412 345 678", "country": "+61"}, "https://wa.me/61412345678"},
+		{"whatsapp", map[string]string{"number": "081234567", "message": "Halo, apa kabar?"}, "https://wa.me/6281234567?text=Halo%2C%20apa%20kabar%3F"},
 	}
 	for _, c := range cases {
 		got, err := Build(c.typ, c.q)
@@ -93,5 +98,13 @@ func TestBuild_VCardAndEvent(t *testing.T) {
 	}
 	if !strings.Contains(e, "SUMMARY:Launch") || !strings.Contains(e, "LOCATION:HQ") {
 		t.Errorf("bad event: %q", e)
+	}
+}
+
+func TestBuild_WhatsAppRejectsBadNumbers(t *testing.T) {
+	for _, n := range []string{"abc", "0", "12345", "1234567890123456"} {
+		if _, err := Build("whatsapp", map[string]string{"number": n}); err == nil {
+			t.Errorf("number %q should be rejected", n)
+		}
 	}
 }
