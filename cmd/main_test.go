@@ -47,3 +47,19 @@ func TestConcurrencyLimit_RejectsWhenBusy(t *testing.T) {
 		t.Errorf("expected 200 after release, got %d", resp.StatusCode)
 	}
 }
+
+func TestDocsHandler(t *testing.T) {
+	app := fiber.New()
+	app.Get("/", docsHandler)
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Errorf("expected HTML content type, got %q", got)
+	}
+}

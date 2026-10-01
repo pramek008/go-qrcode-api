@@ -110,6 +110,7 @@ func main() {
 			return c.Status(429).JSON(fiber.Map{"error": "rate limit exceeded"})
 		},
 	}))
+	app.Get("/", docsHandler)
 
 	if cfg.DatabaseURL != "" {
 		// ── Full mode: DB available ──────────────────────────────────────────
@@ -259,6 +260,62 @@ func registerStatelessMode(app *fiber.App, cfg Config) {
 	app.Get("/metrics", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"mode": "stateless", "db": nil})
 	})
+}
+
+func docsHandler(c *fiber.Ctx) error {
+	c.Set(fiber.HeaderContentType, fiber.MIMETextHTML+"; charset=utf-8")
+	return c.SendString(`<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>QR Service API</title>
+	<style>
+		:root { color-scheme: light dark; font-family: system-ui, -apple-system, sans-serif; }
+		body { max-width: 880px; margin: 0 auto; padding: 48px 24px; line-height: 1.6; }
+		h1 { margin-bottom: 8px; }
+		h2 { margin-top: 36px; }
+		code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+		code { padding: 2px 5px; border-radius: 4px; background: #8882; }
+		pre { overflow-x: auto; padding: 16px; border-radius: 8px; background: #8882; }
+		a { color: #1683d8; }
+		table { width: 100%; border-collapse: collapse; }
+		th, td { padding: 10px 8px; text-align: left; border-bottom: 1px solid #8884; }
+	</style>
+</head>
+<body>
+	<h1>QR Service API</h1>
+	<p>A self-hosted QR code generation API compatible with the goqr.me API format.</p>
+
+	<h2>Quick start</h2>
+	<pre><code>GET /v1/create-qr-code?data=Hello%20World
+
+curl 'https://qrcode.ekanovation.my.id/v1/create-qr-code?data=Hello%20World' \
+	--output qr.png</code></pre>
+
+	<h2>Endpoints</h2>
+	<table>
+		<thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
+		<tbody>
+			<tr><td>GET</td><td><code>/v1/create-qr-code</code></td><td>Generate a QR code from query parameters</td></tr>
+			<tr><td>POST</td><td><code>/v1/create-qr-code</code></td><td>Generate a QR code from form or JSON data</td></tr>
+			<tr><td>GET</td><td><code>/health</code></td><td>Check service status</td></tr>
+			<tr><td>GET</td><td><code>/metrics</code></td><td>View service metrics</td></tr>
+			<tr><td>POST/GET/DELETE</td><td><code>/v1/qr</code></td><td>Manage saved QR codes in full mode</td></tr>
+			<tr><td>POST/GET/DELETE</td><td><code>/v1/admin/keys</code></td><td>Manage API keys in full mode</td></tr>
+		</tbody>
+	</table>
+
+	<h2>Generate options</h2>
+	<p>Use <code>format=png|svg|jpeg|webp</code>, <code>size=300</code>,
+	<code>color=000000</code>, <code>bgcolor=ffffff</code>,
+	<code>recovery=L|M|Q|H</code>, and <code>output=image|base64|json</code>.
+	Structured content types such as <code>wifi</code>, <code>vcard</code>,
+	<code>email</code>, <code>tel</code>, and <code>geo</code> are also supported.</p>
+
+	<p><a href="https://github.com/pramek008/go-qrcode-api#readme-ov-file">Read the complete API documentation on GitHub</a>.</p>
+</body>
+</html>`)
 }
 
 // registerGenerateRoutes wires the stateless generation endpoints, shared by
